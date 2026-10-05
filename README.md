@@ -1,73 +1,111 @@
-# Desktop clap → Jarvis-style welcome
+# Jarvis for macOS — double clap → welcome home
 
-Python script that listens to your default microphone and runs a **double-clap** welcome flow (Spotify, Chrome windows, ElevenLabs voice, Cursor). See constants at the top of `jarvis.py` for behavior and tuning.
+A Python script that listens to your Mac's microphone. When you **clap twice**, it:
 
-## Setup
+1. plays your song in the **Spotify** app,
+2. opens **Claude** and **Tasaradar** in new **Google Chrome** windows (fullscreen, one per display if you have several),
+3. speaks a welcome line in your **ElevenLabs** voice through your Mac speakers,
+4. brings **Cursor** to the front (fullscreen), launching it if needed.
 
-From this project directory:
+The welcome runs once per start. To run it again, stop Jarvis (Ctrl+C) and start it again.
+
+## Requirements
+
+- A Mac running macOS 12 (Monterey) or newer.
+- **Python 3** from https://www.python.org/downloads/macos/ (3.10 or newer recommended).
+- **Spotify**, **Google Chrome** and **Cursor** installed in your Applications folder. Any of them can be missing: Jarvis skips Cursor, and opens Spotify/Chrome links in your default browser instead.
+- An **ElevenLabs** account (API key + voice ID) for the spoken welcome. Without it, everything else still works.
+
+## Install (first time)
+
+1. **Install Python**: download the macOS installer from https://www.python.org/downloads/macos/, open it and click through. When it finishes, a Finder window opens; double-click **Install Certificates.command** in it.
+2. **Download Jarvis**: download the ZIP from GitHub (green **Code** button → **Download ZIP**), double-click it to unzip, rename the folder to `jarvis` and move it into your home folder (the one with your name, next to Desktop and Documents).
+3. **Open Terminal** (press Cmd+Space, type `Terminal`, press Enter) and run:
+
+   ```bash
+   cd ~/jarvis
+   chmod +x start_jarvis.sh
+   ./start_jarvis.sh
+   ```
+
+   The first run sets everything up (about a minute), creates your `.env` settings file, and starts listening. Press **Ctrl+C** to stop it, then add your ElevenLabs details (next section).
+
+## Settings (`.env`)
+
+All settings live in the `.env` file in the `jarvis` folder. To edit it in TextEdit:
 
 ```bash
-python -m pip install -r requirements.txt
+open -e ~/jarvis/.env
 ```
 
-## Environment variables
+(Finder hides files whose names start with a dot. Press Cmd+Shift+. in Finder to show them.)
 
-The script loads a **`.env` file** in the same folder as `jarvis.py` (via `python-dotenv`). You can also set variables in the shell.
+| Setting | What it does | Default |
+| ------- | ------------ | ------- |
+| `ELEVENLABS_API_KEY` | Your ElevenLabs API key (ElevenLabs → profile → API Keys). | *(empty, no voice)* |
+| `ELEVENLABS_VOICE_ID` | The voice to use (ElevenLabs → Voices → ⋯ → Copy voice ID). | *(empty, no voice)* |
+| `JARVIS_WELCOME_PHRASE` | What Jarvis says. | `Welcome home, sir. All systems are online.` |
+| `JARVIS_WELCOME_ENABLED` | `false` turns the voice off. | `true` |
+| `JARVIS_AFTER_SONG_DELAY_S` | Seconds between starting the song and speaking. | `1.0` |
+| `JARVIS_SONG_URI` | Spotify link (`https://open.spotify.com/track/…` or `spotify:track:…`) or a YouTube link. | the original track |
+| `SPOTIFY_VOLUME` | Spotify volume 0–100 set before playing. | unchanged |
+| `CLAUDE_CODE_URL` | First Chrome window. | `https://claude.ai/new` |
+| `TASARADAR_URL` | Second Chrome window. `BINANCE_BTC_URL` from older setups is still read if this is empty. | `https://tasaradar.com` |
+| `OPEN_CLAUDE_CODE_IN_CHROME` / `OPEN_TASARADAR_IN_CHROME` | `false` skips that window. | `true` |
+| `CLAUDE_CHROME_MONITOR` / `TASARADAR_CHROME_MONITOR` | Display number (1 = leftmost). If you have fewer displays, the last one is used. | `1` / `3` |
+| `OPEN_CHROME_FULLSCREEN` | `true` = macOS fullscreen, `false` = normal window. | `true` |
+| `CHROME_WINDOW_WIDTH` / `CHROME_WINDOW_HEIGHT` | Window size when not fullscreen. | `1400` / `900` |
+| `CHROME_SEPARATE_SITE_PROFILES` | `true` = each site opens in its own temporary Chrome profile (no logins). | `false` |
+| `CURSOR_OPEN_FULLSCREEN` | `true` puts Cursor in fullscreen. | `true` |
+| `FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP` / `OPEN_NEW_CURSOR_ON_DOUBLE_CLAP` | Bring Cursor forward / also open a new Cursor window. | `true` / `false` |
+| `JARVIS_INPUT_DEVICE` | Force a microphone by name (e.g. `MacBook Pro Microphone`) or number. | your default mic |
+| `JARVIS_SPIKE_RATIO` | Clap sensitivity: higher = needs louder claps. | `7.0` |
+| `JARVIS_SAMPLE_RATE` | Try `48000` if your mic complains. | `44100` |
+| `ELEVENLABS_MODEL_ID` / `ELEVENLABS_OUTPUT_FORMAT` / `ELEVENLABS_PCM_SAMPLE_RATE` | Advanced TTS options (format must be `pcm_…`). | `eleven_multilingual_v2` / `pcm_24000` |
+| `JARVIS_WELCOME_CACHE_DIR` / `JARVIS_WELCOME_CACHE_ENABLED` | Where the spoken welcome is cached, so ElevenLabs is only called when the phrase or voice changes. | `.cache/jarvis_welcome/` / `true` |
 
-### Required (ElevenLabs welcome line)
-
-| Variable | Purpose |
-| -------- | ------- |
-| `ELEVENLABS_API_KEY` | API key from [ElevenLabs](https://elevenlabs.io). |
-| `ELEVENLABS_VOICE_ID` | Voice ID from the ElevenLabs app (My Voices / library). |
-
-Without these, the welcome speech is skipped (other actions may still run).
-
-### Optional
-
-| Variable | Purpose |
-| -------- | ------- |
-| `ELEVENLABS_MODEL_ID` | TTS model (default in code: `eleven_multilingual_v2`). |
-| `ELEVENLABS_OUTPUT_FORMAT` | e.g. `pcm_24000` (must match playback expectations). |
-| `ELEVENLABS_PCM_SAMPLE_RATE` | Override PCM sample rate if it differs from the format name. |
-| `JARVIS_WELCOME_CACHE_DIR` | Custom folder for cached welcome WAV (default: `.cache/jarvis_welcome/` under the project). |
-| `JARVIS_INPUT_DEVICE` | Optional mic override: **integer** index or **substring** of the device name. If unset, the script uses the Windows default; when that mic is silent, it auto-picks the loudest working input. List devices: `python -c "import sounddevice as sd; print(sd.query_devices())"`. |
-| `CLAUDE_CODE_URL` | URL opened for Claude in Chrome (default: new chat). |
-| `TASARADAR_URL` | URL opened for Tasaradar in Chrome (default: `https://tasaradar.com`). `BINANCE_BTC_URL` is still read as a fallback if set. |
-| `CHROME_NEW_WINDOW_WAIT_S` | Seconds to wait for a new Chrome window on Windows (default `25`). |
-| `CHROME_WINDOW_WIDTH` / `CHROME_WINDOW_HEIGHT` | Windowed Chrome size when not fullscreen. |
-
-Example `.env`:
-
-```env
-ELEVENLABS_API_KEY=your_key_here
-ELEVENLABS_VOICE_ID=your_voice_id_here
-```
+Save the file, then restart Jarvis for changes to take effect.
 
 ## Run
 
 ```bash
-python jarvis.py
+cd ~/jarvis
+./start_jarvis.sh
 ```
 
-Allow the microphone if Windows prompts you. Stop with **Ctrl+C**.
+Wait for `Ready — clap twice.`, then clap twice quickly. Stop with **Ctrl+C**.
+
+## macOS permissions (first run)
+
+macOS asks for permission the first time Jarvis does each thing. Click **Allow** / **OK** each time:
+
+| Prompt | Why |
+| ------ | --- |
+| "Terminal" would like to access the microphone | Hearing your claps. |
+| "Terminal" wants access to control "Spotify" / "Google Chrome" / "System Events" | Playing the song, opening windows. |
+| Accessibility access | Putting Chrome and Cursor into fullscreen. Open **System Settings → Privacy & Security → Accessibility** and switch on **Terminal**. |
+
+If you click "Don't Allow" by mistake, turn it back on in **System Settings → Privacy & Security** under **Microphone**, **Automation** or **Accessibility**, then quit Terminal (Cmd+Q) and start again. Without Accessibility access, everything still opens, but windows only fill the screen instead of going fullscreen.
 
 ## Tuning
 
-Edit the constants at the top of `jarvis.py`:
+Clap detection constants are at the top of `jarvis.py`:
 
 | Constant      | Effect                                                            |
 | ------------- | ----------------------------------------------------------------- |
 | `SPIKE_RATIO` | Increase if you get false triggers; decrease if claps are missed. |
 | `COOLDOWN_S`  | Minimum time between two logged claps.                            |
 | `BLOCK_MS`    | Larger = slightly less CPU, a bit less precise timing.            |
-| `MIN_RMS`     | Floor on how loud a block must be (helps in very quiet rooms).  |
+| `MIN_RMS`     | Floor on how loud a block must be (helps in very quiet rooms).    |
 | `SAMPLE_RATE` | Try `48000` if your device does not like `44100`.                 |
 
 ## Troubleshooting
 
-- **Wrong or quiet mic:** On startup the script probes your default Windows input. If it is silent, it **auto-selects** the loudest working mic. To force a specific device, set `JARVIS_INPUT_DEVICE` in `.env` (index or name substring from `sounddevice.query_devices()`).
-- **PortAudio / audio errors:** Update audio drivers or try another `SAMPLE_RATE`.
-- **No reaction to claps:** Lower `SPIKE_RATIO` slightly or speak/clap closer to the mic.
-- **Spam logs:** Raise `SPIKE_RATIO` or `COOLDOWN_S`.
-- **No welcome speech:** Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env` and restart the terminal so variables load.
+- **"Every microphone sounds silent":** Microphone permission is off. Turn on Terminal in **System Settings → Privacy & Security → Microphone**, quit Terminal with Cmd+Q, and start again.
+- **Wrong mic:** Jarvis prints the list of audio devices on startup. Put the name (or number) of the one you want in `JARVIS_INPUT_DEVICE`.
+- **No reaction to claps:** Lower `JARVIS_SPIKE_RATIO` (e.g. `5`) or clap closer to the Mac.
+- **Triggers on random noise:** Raise `JARVIS_SPIKE_RATIO` (e.g. `10`).
+- **Spotify opens but doesn't play:** Make sure you're logged in to the Spotify app, and that Terminal is allowed to control Spotify under **Privacy & Security → Automation**.
+- **Windows don't go fullscreen:** Give Terminal Accessibility access (see above).
+- **No welcome speech:** Check `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`, and look for an `ElevenLabs TTS failed` line in Terminal.
+- **`zsh: permission denied: ./start_jarvis.sh`:** Run `chmod +x start_jarvis.sh` once.
