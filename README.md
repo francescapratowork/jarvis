@@ -43,7 +43,7 @@ open -e ~/jarvis/.env
 | Setting | What it does | Default |
 | ------- | ------------ | ------- |
 | `ELEVENLABS_API_KEY` | Your ElevenLabs API key (ElevenLabs → profile → API Keys). | *(empty, no voice)* |
-| `ELEVENLABS_VOICE_ID` | The voice to use (ElevenLabs → Voices → ⋯ → Copy voice ID). | *(empty, no voice)* |
+| `ELEVENLABS_VOICE_ID` | The voice to use (ElevenLabs → Voices → ⋯ → Copy voice ID). Only the ID itself: letters and numbers, no spaces, no quotes, e.g. `ELEVENLABS_VOICE_ID=AbCdEf1234567890xyz`. | *(empty, no voice)* |
 | `JARVIS_WELCOME_PHRASE` | What Jarvis says. | `Welcome home, sir. All systems are online.` |
 | `JARVIS_WELCOME_ENABLED` | `false` turns the voice off. | `true` |
 | `JARVIS_AFTER_SONG_DELAY_S` | Seconds between starting the song and speaking. | `1.0` |
@@ -69,6 +69,27 @@ open -e ~/jarvis/.env
 | `JARVIS_WELCOME_CACHE_DIR` / `JARVIS_WELCOME_CACHE_ENABLED` | Where the spoken welcome is cached, so ElevenLabs is only called when the phrase or voice changes. | `.cache/jarvis_welcome/` / `true` |
 
 Save the file, then restart Jarvis for changes to take effect.
+
+## Update Jarvis
+
+To get the latest version, without touching your `.env` settings:
+
+```bash
+cd ~/jarvis
+./update_jarvis.sh
+```
+
+(If `update_jarvis.sh` isn't in your folder yet, download it once with:
+`curl -fsSL https://raw.githubusercontent.com/francescapratowork/jarvis/main/update_jarvis.sh -o ~/jarvis/update_jarvis.sh && chmod +x ~/jarvis/update_jarvis.sh`.)
+
+Every time Jarvis starts, its first lines show which version is running and from which folder, e.g.:
+
+```
+Jarvis version 2026-10-05.6 (Spotify AppleScript fix, updater) — running /Users/you/jarvis/jarvis.py
+Settings file: /Users/you/jarvis/.env (found)
+```
+
+If the version or folder isn't what you expect, you're running an old copy.
 
 ## Run
 
@@ -147,5 +168,6 @@ Advanced shape checks (`CLAP_RMS_RATIO`, `MIN_HF_RATIO`, `MAX_CLAP_LEN_S`, `QUIE
   - *volume is almost 0*: set `SPOTIFY_VOLUME=60` in `.env`.
   - Also check your Mac isn't muted. Jarvis warns if it is.
 - **Windows don't go fullscreen:** Give Terminal Accessibility access (see above).
-- **No welcome speech:** Check `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`, and look for an `ElevenLabs TTS failed` line in Terminal.
+- **No welcome speech:** Check `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`, and look for an `ElevenLabs TTS failed` line in Terminal. A `404 Not Found` whose address contains something other than your voice ID (e.g. `/v1/text-to-speech/open%20-e%20...`) means the `ELEVENLABS_VOICE_ID=` line holds the wrong text: put only the voice ID after the `=`.
+- **A fix doesn't seem to apply:** Check the `Jarvis version … running …` line at startup, then run `./update_jarvis.sh`.
 - **`zsh: permission denied: ./start_jarvis.sh`:** Run `chmod +x start_jarvis.sh` once.

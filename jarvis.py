@@ -73,7 +73,10 @@ from dotenv import load_dotenv
 import numpy as np
 import sounddevice as sd
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Bump on every release so the startup log shows which code is actually running.
+JARVIS_VERSION = "2026-10-05.6 (Spotify AppleScript fix, updater)"
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(ENV_PATH)
 
 IS_MAC = sys.platform == "darwin"
 
@@ -1153,6 +1156,8 @@ def _describe(info: dict) -> str:
 
 def main() -> int:
     test_mode = "--test" in sys.argv[1:] or _env_bool("JARVIS_TEST_MODE", False)
+    log.info("Jarvis version %s — running %s", JARVIS_VERSION, Path(__file__).resolve())
+    log.info("Settings file: %s (%s)", ENV_PATH, "found" if ENV_PATH.is_file() else "NOT FOUND")
     blocksize = block_samples()
     block_s = blocksize / SAMPLE_RATE
     detector = ClapDetector(block_s)
