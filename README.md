@@ -59,7 +59,9 @@ open -e ~/jarvis/.env
 | `CURSOR_OPEN_FULLSCREEN` | `true` puts Cursor in fullscreen. | `true` |
 | `FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP` / `OPEN_NEW_CURSOR_ON_DOUBLE_CLAP` | Bring Cursor forward / also open a new Cursor window. | `true` / `false` |
 | `JARVIS_INPUT_DEVICE` | Force a microphone by name (e.g. `MacBook Pro Microphone`) or number. | your default mic |
-| `JARVIS_SPIKE_RATIO` | Clap sensitivity: higher = needs louder claps. | `7.0` |
+| `JARVIS_SPIKE_RATIO` | Clap sensitivity: how many times louder than the room a clap must be. Lower = more sensitive. | `4.0` |
+| `JARVIS_MAX_DOUBLE_GAP_S` | Longest pause allowed between the two claps, in seconds. | `0.8` |
+| `JARVIS_LEVEL_LOG_S` | How often the live sound-level line is printed (seconds, `0` = off). | `5` |
 | `JARVIS_SAMPLE_RATE` | Try `48000` if your mic complains. | `44100` |
 | `ELEVENLABS_MODEL_ID` / `ELEVENLABS_OUTPUT_FORMAT` / `ELEVENLABS_PCM_SAMPLE_RATE` | Advanced TTS options (format must be `pcm_…`). | `eleven_multilingual_v2` / `pcm_24000` |
 | `JARVIS_WELCOME_CACHE_DIR` / `JARVIS_WELCOME_CACHE_ENABLED` | Where the spoken welcome is cached, so ElevenLabs is only called when the phrase or voice changes. | `.cache/jarvis_welcome/` / `true` |
@@ -73,7 +75,28 @@ cd ~/jarvis
 ./start_jarvis.sh
 ```
 
-Wait for `Ready — clap twice.`, then clap twice quickly. Stop with **Ctrl+C**.
+Stay quiet for the first two seconds while Jarvis measures the room noise. When you see `Ready — clap twice.`, clap twice quickly (a short pause, like "clap–clap"). Stop with **Ctrl+C**.
+
+## Test your claps (nothing opens)
+
+```bash
+cd ~/jarvis
+./start_jarvis.sh --test
+```
+
+Clap as often as you like and watch the Terminal:
+
+```
+Room noise: peak 0.0506 (rms 0.0149). Clap threshold set to peak 0.2025.
+Ready — clap twice.
+Clap 1 heard (peak 0.812, rms 0.1102, threshold 0.206) — clap again within 0.8s...
+Clap 2 heard (peak 0.934, rms 0.1240) — DOUBLE CLAP DETECTED!
+Level: room noise 0.0512 | loudest 0.9340 (rms 0.1240) | clap threshold 0.2049
+```
+
+- **Clap 1 / Clap 2 heard** — a clap was detected, with its measured peak and RMS.
+- **Level** (every 5 seconds) — the room noise, the loudest sound since the last line, and how loud a clap must be. Jarvis keeps re-measuring the room, so the threshold adapts on its own.
+- If you clap and only see `a sound reached 70% of the threshold`, your claps are too soft for the current setting: lower `JARVIS_SPIKE_RATIO` (e.g. to `3`) in `.env`.
 
 ## macOS permissions (first run)
 
@@ -89,22 +112,15 @@ If you click "Don't Allow" by mistake, turn it back on in **System Settings → 
 
 ## Tuning
 
-Clap detection constants are at the top of `jarvis.py`:
-
-| Constant      | Effect                                                            |
-| ------------- | ----------------------------------------------------------------- |
-| `SPIKE_RATIO` | Increase if you get false triggers; decrease if claps are missed. |
-| `COOLDOWN_S`  | Minimum time between two logged claps.                            |
-| `BLOCK_MS`    | Larger = slightly less CPU, a bit less precise timing.            |
-| `MIN_RMS`     | Floor on how loud a block must be (helps in very quiet rooms).    |
-| `SAMPLE_RATE` | Try `48000` if your device does not like `44100`.                 |
+The clap threshold calibrates itself to your room. Usually the only knob you need is `JARVIS_SPIKE_RATIO` in `.env` (lower = more sensitive, higher = fewer false triggers). Advanced constants are at the top of `jarvis.py` (`BLOCK_MS`, `MIN_DOUBLE_GAP_S`, `MIN_CLAP_PEAK`, `MAX_CLAP_THRESHOLD`, `NOISE_WINDOW_S`, `CALIBRATION_S`).
 
 ## Troubleshooting
 
 - **"Every microphone sounds silent":** Microphone permission is off. Turn on Terminal in **System Settings → Privacy & Security → Microphone**, quit Terminal with Cmd+Q, and start again.
 - **Wrong mic:** Jarvis prints the list of audio devices on startup. Put the name (or number) of the one you want in `JARVIS_INPUT_DEVICE`.
-- **No reaction to claps:** Lower `JARVIS_SPIKE_RATIO` (e.g. `5`) or clap closer to the Mac.
-- **Triggers on random noise:** Raise `JARVIS_SPIKE_RATIO` (e.g. `10`).
+- **No reaction to claps:** Run `./start_jarvis.sh --test`. If no `Clap heard` lines appear, lower `JARVIS_SPIKE_RATIO` (e.g. `3`) or clap closer to the Mac. If `Clap 1` appears but never `Clap 2`, clap a bit faster (within 0.8 s).
+- **Triggers on random noise:** Raise `JARVIS_SPIKE_RATIO` (e.g. `6`).
+- **"The room (or mic gain) is very loud":** Lower the input volume in **System Settings → Sound → Input**.
 - **Spotify opens but doesn't play:** Make sure you're logged in to the Spotify app, and that Terminal is allowed to control Spotify under **Privacy & Security → Automation**.
 - **Windows don't go fullscreen:** Give Terminal Accessibility access (see above).
 - **No welcome speech:** Check `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`, and look for an `ElevenLabs TTS failed` line in Terminal.
