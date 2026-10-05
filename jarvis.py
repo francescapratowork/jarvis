@@ -13,13 +13,12 @@ Everything a user is likely to change can be set in a `.env` file next to this s
 (see `.env.example`). The constants below are only the defaults.
 
 Clap detection:
-  Jarvis measures the room noise for a couple of seconds at startup and keeps re-measuring it
-  (median loudness of the last few seconds), so the clap threshold follows your room
-  automatically. A clap is a short, sharp sound whose peak is JARVIS_SPIKE_RATIO times louder
-  than the room noise; two claps 0.1–0.8 s apart trigger the welcome.
-  Run `./start_jarvis.sh --test` to only test claps (nothing opens, and you can clap repeatedly).
-  Every few seconds (JARVIS_LEVEL_LOG_S) a level line shows the room noise, the loudest recent
-  sound and the current clap threshold.
+  Production: calibrate → wait for ONE valid double clap → close the microphone → run the
+  welcome once → exit. `./start_jarvis.sh --test` keeps listening and only logs claps.
+  The threshold is room noise × JARVIS_SPIKE_RATIO (re-measured continuously), but never below
+  JARVIS_MIN_CLAP_PEAK. Each loud sound is then checked for clap shape (short, ≥5 ms wide,
+  bright) and the two claps must be 0.15–0.8 s apart with quiet around them, which rejects
+  speech, typing, clicks and music. Every decision is logged with its measurements.
 
   SAMPLE_RATE   — usually 44100 or 48000; match your device if needed.
   BLOCK_MS      — analysis window size (claps are only ~10 ms long, so keep it short).
@@ -27,6 +26,8 @@ Clap detection:
                     raise if false triggers; lower if claps are missed.
   MIN_DOUBLE_GAP_S / MAX_DOUBLE_GAP_S — allowed time between the two claps.
   MIN_CLAP_PEAK / MAX_CLAP_THRESHOLD — absolute limits for the automatic threshold.
+  MIN_CLAP_WIDTH_MS / MIN_HF_RATIO / MAX_CLAP_LEN_S / QUIET_BEFORE_S / QUIET_AFTER_S — clap shape
+                    and isolation checks.
 
 Actions (macOS):
   SONG_URI      — Spotify or YouTube URL/URI (env JARVIS_SONG_URI). Spotify links are played in
@@ -44,8 +45,8 @@ Actions (macOS):
     With JARVIS_WELCOME_CACHE_ENABLED, audio is saved under `.cache/jarvis_welcome/` (WAV) and
     replayed when phrase + voice + model + format match—no repeat API call. Delete that folder
     or set JARVIS_WELCOME_CACHE_ENABLED=false to force a fresh fetch.
-  The welcome sequence runs only once per process. The assistant speaks in the background so Cursor
-    opens without waiting for playback to finish (restart the script to run again).
+  The welcome sequence runs only once per process; Spotify is started (and confirmed playing)
+    first, then Chrome and Cursor open while the welcome is spoken.
 """
 
 from __future__ import annotations
@@ -107,17 +108,27 @@ SAMPLE_RATE = _env_int("JARVIS_SAMPLE_RATE", 44100)
 BLOCK_MS = 20
 CHANNELS = 1
 
-# A clap's peak must be this many times the room-noise peak (auto-calibrated).
-SPIKE_RATIO = _env_float("JARVIS_SPIKE_RATIO", 4.0)
-COOLDOWN_S = 1.0  # after a double clap, ignore claps for this long
-MIN_DOUBLE_GAP_S = 0.1
+# A clap's peak must be this many times the room-noise peak (auto-calibrated)...
+SPIKE_RATIO = _env_float("JARVIS_SPIKE_RATIO", 5.0)
+# ...and never below this absolute peak, however quiet the room is (full scale = 1.0).
+# Real MacBook logs showed the adaptive threshold sinking to 0.03 in a quiet room, where
+# speech, typing and clicks then counted as claps. A hand clap at desk distance peaks well
+# above 0.15; raise this if sounds still trigger, lower it if your claps are ignored.
+MIN_CLAP_PEAK = _env_float("JARVIS_MIN_CLAP_PEAK", 0.15)
+MAX_CLAP_THRESHOLD = 0.6  # cap, so a loud clap still works in a noisy room
+MIN_DOUBLE_GAP_S = 0.15
 MAX_DOUBLE_GAP_S = _env_float("JARVIS_MAX_DOUBLE_GAP_S", 0.8)
-CLAP_REFRACTORY_S = 0.07  # a clap's own echo/decay is not a second clap
-RETRIGGER_RATIO = 0.6  # sound must fall below threshold * this before the next clap counts
+RETRIGGER_RATIO = 0.6  # sound must fall below threshold * this before the next sound counts
+# Shape checks that tell a clap from other sounds:
+MAX_CLAP_LEN_S = 0.2  # claps die away fast; longer sounds are voice/music
+CLAP_DECAY_RATIO = 0.3  # "died away" = block peak below this fraction of the clap's peak
+MIN_CLAP_RMS = 0.02  # energy over 40 ms around the peak; clicks/taps are thinner
+MIN_CLAP_WIDTH_MS = 5.0  # time the sound stays above 30% of its peak; clicks/keys ~2-4 ms
+MIN_HF_RATIO = 0.4  # share of energy above 1 kHz; voices and thumps are lower-pitched
+QUIET_BEFORE_S = 0.4  # no other loud sound just before clap 1 (rejects typing/speech)
+QUIET_AFTER_S = 0.35  # ...nor just after clap 2
 NOISE_WINDOW_S = 3.0  # room noise = median block peak over this many recent seconds
 CALIBRATION_S = 1.5  # measure the room before listening
-MIN_CLAP_PEAK = 0.03  # threshold never goes below this (full scale = 1.0)
-MAX_CLAP_THRESHOLD = 0.6  # ...or above this, so a loud clap still works in a noisy room
 LEVEL_LOG_S = _env_float("JARVIS_LEVEL_LOG_S", 5.0)  # 0 = no periodic level line
 # Startup mic probe: if default input RMS stays below this, scan for a louder device.
 INPUT_PROBE_S = 0.5
@@ -637,57 +648,147 @@ def _spotify_web_url(uri: str) -> str:
     return uri
 
 
-def _play_in_spotify_app(uri: str) -> None:
+def _spotify_running() -> bool:
+    try:
+        return (
+            subprocess.run(["pgrep", "-x", "Spotify"], capture_output=True).returncode == 0
+        )
+    except OSError:
+        return False
+
+
+def _spotify_try_play(command: str, attempts: int) -> tuple[str, list[str]]:
+    """Run a Spotify play command until the player reports "playing".
+
+    Returns (status, fields): status is "ok" (fields: name, artist, volume),
+    "error" (fields: error number, message) or "notplaying" (fields: state, last error).
+    """
     volume = ""
     if SPOTIFY_VOLUME.isdigit():
         volume = f"set sound volume to {max(0, min(100, int(SPOTIFY_VOLUME)))}"
-    # Spotify may still be starting up, so retry until it reports it is playing.
     script = f"""
-tell application "Spotify"
-  {volume}
-  set ok to false
-  repeat 30 times
-    try
-      play track {_as_str(uri)}
-      delay 0.5
+set lastErr to ""
+repeat {attempts} times
+  try
+    tell application "Spotify"
+      {volume}
+      {command}
+    end tell
+    delay 1
+    tell application "Spotify"
       if player state is playing then
-        set ok to true
-        exit repeat
+        set t to current track
+        return "ok|" & (name of t) & "|" & (artist of t) & "|" & (sound volume as text)
       end if
-    end try
-    delay 0.5
-  end repeat
-  return ok
-end tell
+    end tell
+  on error errMsg number errNum
+    set lastErr to (errNum as text) & "|" & errMsg
+    if errNum is -1743 then return "error|" & lastErr
+  end try
+  delay 0.5
+end repeat
+set st to "unknown"
+try
+  tell application "Spotify" to set st to (player state as text)
+end try
+return "notplaying|" & st & "|" & lastErr
 """
-    ok, out, err = _osascript(script, timeout=60)
+    ok, out, err = _osascript(script, timeout=attempts * 2.0 + 30)
     if not ok:
-        _log_osascript_failure("Spotify playback", "Spotify", err)
-    elif out != "true":
-        log.warning("Spotify did not start playing %s (is it logged in?).", uri)
-    else:
-        log.info("Spotify is playing %s", uri)
+        return "error", ["", err]
+    status, _, rest = out.partition("|")
+    return status, rest.split("|")
 
 
-def play_song(uri: str) -> None:
+def _play_in_spotify_app(uri: str) -> bool:
+    """Launch Spotify if needed, play `uri`, and log a clear result."""
+    if not _spotify_running():
+        log.info("Spotify: starting the app...")
+        subprocess.run(["open", "-g", "-a", "Spotify"], check=False)
+        deadline = time.monotonic() + 20
+        while not _spotify_running() and time.monotonic() < deadline:
+            time.sleep(0.5)
+        if not _spotify_running():
+            log.error("Spotify: ERROR — the app did not start within 20 seconds.")
+            return False
+        time.sleep(3)  # let it log in and load the player
+    log.info("Spotify: asking it to play %s ...", uri)
+
+    status, fields = _spotify_try_play(f"play track {_as_str(uri)}", attempts=10)
+    if status == "notplaying":
+        # Fallback: open the track via its spotify: link, then press play.
+        log.info("Spotify: not playing yet (state: %s); retrying via the track link...", fields[0])
+        subprocess.run(["open", "-g", uri], check=False)
+        time.sleep(1.5)
+        status, fields = _spotify_try_play("play", attempts=6)
+
+    if status == "ok":
+        name, artist, volume = (fields + ["", "", ""])[:3]
+        log.info("Spotify: SUCCESS — playing \"%s\" by %s (Spotify volume %s%%).", name, artist, volume)
+        if volume.isdigit() and int(volume) < 10:
+            log.warning("Spotify: its volume is almost 0 — set SPOTIFY_VOLUME=60 in .env.")
+        return True
+    if status == "error":
+        num, msg = (fields + ["", ""])[:2]
+        if num == "-1743" or "-1743" in msg or "not authorized" in msg.lower():
+            log.error(
+                "Spotify: ERROR — macOS did not allow Jarvis to control Spotify. Open System "
+                "Settings → Privacy & Security → Automation → Terminal and turn on Spotify, "
+                "then quit Terminal (Cmd+Q) and start again."
+            )
+        else:
+            log.error("Spotify: ERROR — %s %s", num, msg)
+        return False
+    state, last = fields[0] if fields else "unknown", "|".join(fields[1:])
+    log.error(
+        "Spotify: ERROR — the app did not start playing (state: %s%s). Check that you are "
+        "logged in, that the track plays when you click it in Spotify, and that no other "
+        "device is controlling playback (Spotify Connect).",
+        state,
+        f"; last error: {last}" if last else "",
+    )
+    return False
+
+
+def play_song(uri: str) -> bool:
+    """Start the configured song. On macOS with the Spotify app this waits until Spotify
+    reports it is playing (or fails), so any permission prompt shows before Chrome opens."""
     u = uri.strip()
     if not u:
-        return
+        log.info("No song configured (JARVIS_SONG_URI is empty).")
+        return False
     spotify = _spotify_uri(u)
-    if IS_MAC and spotify and _mac_app_path("Spotify"):
-        # Runs in the background: a cold Spotify start can take several seconds.
-        threading.Thread(target=_play_in_spotify_app, args=(spotify,), daemon=True).start()
-        return
-    if spotify and not u.startswith("http"):
-        log.info("Spotify app not found; opening the web player instead.")
+    if IS_MAC and spotify:
+        if _mac_app_path("Spotify"):
+            return _play_in_spotify_app(spotify)
+        log.warning("Spotify: app not found in Applications; opening the web player instead.")
         u = _spotify_web_url(spotify)
     try:
         if IS_MAC:
             subprocess.run(["open", u], check=False)
         else:
             webbrowser.open(u)
+        log.info("Opened song link: %s", u)
+        return True
     except OSError as e:
-        log.warning("Could not open SONG_URI: %s", e)
+        log.warning("Could not open JARVIS_SONG_URI: %s", e)
+        return False
+
+
+def _check_mac_output_volume() -> None:
+    """Warn if the Mac's speakers are muted or at zero (no permission needed)."""
+    ok, out, _ = _osascript(
+        "set v to get volume settings\n"
+        "return ((output volume of v) as text) & \"|\" & ((output muted of v) as text)",
+        timeout=5,
+    )
+    if not ok:
+        return
+    vol, _, muted = out.partition("|")
+    if muted == "true" or vol == "0":
+        log.warning("Your Mac's sound is muted or at 0 — turn the volume up to hear Jarvis.")
+    else:
+        log.info("Mac output volume: %s%%", vol)
 
 
 # --- Chrome -------------------------------------------------------------------
@@ -832,32 +933,61 @@ def open_cursor_window() -> None:
 
 
 def run_double_clap_actions() -> None:
-    """Run outside the mic loop so sleeps do not stall capture."""
+    """The welcome sequence. Runs once, after the microphone is closed, and returns only
+    when everything (including the spoken welcome) has finished."""
+    if IS_MAC:
+        _check_mac_output_volume()
     play_song(SONG_URI)
     open_claude_in_chrome()
     open_tasaradar_in_chrome()
+    voice: threading.Thread | None = None
     if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
         delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
         if delay:
             time.sleep(delay)
-        threading.Thread(target=say_jarvis_welcome, daemon=True).start()
+        voice = threading.Thread(target=say_jarvis_welcome, daemon=True)
+        voice.start()
     open_cursor_window()
+    if voice is not None:
+        voice.join(timeout=120)
+
+
+def _hf_ratio(seg: np.ndarray) -> float:
+    """Share of the signal's energy above 1 kHz (ignoring DC/rumble below 80 Hz)."""
+    if seg.size < 16:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg - np.mean(seg))) ** 2
+    freqs = np.fft.rfftfreq(seg.size, 1.0 / SAMPLE_RATE)
+    total = float(np.sum(spec[freqs >= 80]))
+    if total <= 0:
+        return 0.0
+    return float(np.sum(spec[freqs >= 1000])) / total
 
 
 class ClapDetector:
-    """Detects double claps from per-block peak levels, with an adaptive noise floor.
+    """Detects a double clap and rejects speech, typing, clicks and music.
 
-    The noise floor is the median block peak over the last NOISE_WINDOW_S seconds, so it
-    follows the room (fans, AC, traffic) and is barely moved by the claps themselves.
+    Every loud onset (block peak over the threshold) is recorded. Once it dies away it is
+    checked: a clap is short (< MAX_CLAP_LEN_S), full-bodied (RMS around the peak) and
+    bright (energy above 1 kHz). A double clap is two such claps MIN–MAX_DOUBLE_GAP_S apart,
+    of similar loudness, with no other loud sound shortly before, between, or after them.
+
+    The threshold is room noise × SPIKE_RATIO (room noise = median block peak of quiet
+    blocks over the last NOISE_WINDOW_S), clamped to [MIN_CLAP_PEAK, MAX_CLAP_THRESHOLD].
+
+    feed() returns a list of (kind, info) events: "clap1", "clap2", "double",
+    "rejected" (info["reason"]).
     """
 
     def __init__(self, block_s: float) -> None:
         self.block_s = block_s
         self.history: deque[float] = deque(maxlen=max(10, int(NOISE_WINDOW_S / block_s)))
         self.armed = True
-        self.last_hit: float | None = None
-        self.first_clap: float | None = None
-        self.last_double = -1e9
+        self.prev_block: np.ndarray = np.zeros(0, dtype=np.float32)
+        self.pending: dict | None = None  # the loud sound currently being measured
+        self.loud_onsets: deque[float] = deque(maxlen=64)
+        self.first: dict | None = None  # confirmed clap 1
+        self.second: dict | None = None  # confirmed clap 2, waiting for quiet after
 
     def noise_floor(self) -> float:
         return float(np.median(self.history)) if self.history else 0.0
@@ -865,38 +995,133 @@ class ClapDetector:
     def threshold(self) -> float:
         return min(max(self.noise_floor() * SPIKE_RATIO, MIN_CLAP_PEAK), MAX_CLAP_THRESHOLD)
 
-    def calibrate(self, peak: float) -> None:
-        self.history.append(peak)
+    def calibrate(self, block: np.ndarray) -> None:
+        self.history.append(peak_mono(block))
+        self.prev_block = block.reshape(-1)
 
-    def feed(self, now: float, peak: float, rms: float) -> str | None:
-        """Process one block. Returns "clap", "double" or None."""
-        threshold = self.threshold()
-        event: str | None = None
-        if not self.armed and peak < threshold * RETRIGGER_RATIO:
-            if self.last_hit is None or now - self.last_hit >= CLAP_REFRACTORY_S:
-                self.armed = True
-        if self.armed and peak >= threshold:
-            self.armed = False
-            self.last_hit = now
-            if now - self.last_double < COOLDOWN_S:
-                pass
-            elif self.first_clap is not None and (
-                MIN_DOUBLE_GAP_S <= now - self.first_clap <= MAX_DOUBLE_GAP_S
+    def reset(self) -> None:
+        self.first = None
+        self.second = None
+
+    def _loud_between(self, t0: float, t1: float, exclude: tuple[float, ...]) -> bool:
+        return any(t0 < t < t1 and t not in exclude for t in self.loud_onsets)
+
+    def _measure(self, p: dict) -> dict:
+        x = np.concatenate(p["blocks"])
+        i = int(np.argmax(np.abs(x)))
+        a = max(0, i - int(0.005 * SAMPLE_RATE))
+        seg = x[a : a + int(0.040 * SAMPLE_RATE)]
+        peak = float(np.max(np.abs(x)))
+        rms = rms_mono(seg)
+        # Width of the sound: smooth |x| over 1 ms, count time above 30% of its maximum.
+        k = max(1, int(0.001 * SAMPLE_RATE))
+        env = np.convolve(np.abs(x[a : a + int(0.060 * SAMPLE_RATE)]), np.ones(k) / k, "same")
+        width_ms = 1000.0 * float(np.sum(env >= 0.3 * env.max())) / SAMPLE_RATE if env.size else 0.0
+        return {
+            "t": p["t"],
+            "peak": peak,
+            "rms": rms,
+            "width_ms": width_ms,
+            "hf": _hf_ratio(seg),
+            "length": p["length"],
+            "threshold": p["threshold"],
+        }
+
+    def _classify(self, p: dict, too_long: bool) -> list[tuple[str, dict]]:
+        info = self._measure(p)
+        reason = ""
+        if too_long:
+            reason = "lasted too long — voice or music?"
+        elif info["rms"] < MIN_CLAP_RMS or info["width_ms"] < MIN_CLAP_WIDTH_MS:
+            reason = "too thin — a click, tap or key press?"
+        elif info["hf"] < MIN_HF_RATIO:
+            reason = "too low-pitched — voice or a thump?"
+        if reason:
+            info["reason"] = reason
+            if self.first and not self.second:
+                self.first = None  # a non-clap between the claps breaks the pattern
+            return [("rejected", info)]
+
+        t = info["t"]
+        if self.first is not None:
+            gap = t - self.first["t"]
+            loudness = max(info["peak"], self.first["peak"]) / max(
+                1e-9, min(info["peak"], self.first["peak"])
+            )
+            if (
+                MIN_DOUBLE_GAP_S <= gap <= MAX_DOUBLE_GAP_S
+                and loudness <= 4.0
+                and not self._loud_between(self.first["t"], t, (self.first["t"], t))
             ):
-                event = "double"
-                self.first_clap = None
-                self.last_double = now
-            elif self.first_clap is not None and now - self.first_clap < MIN_DOUBLE_GAP_S:
-                pass  # same clap ringing on
-            else:
-                event = "clap"
-                self.first_clap = now
-        else:
-            # Only quiet blocks update the room-noise estimate.
-            self.history.append(peak)
-        if self.first_clap is not None and now - self.first_clap > MAX_DOUBLE_GAP_S:
-            self.first_clap = None
-        return event
+                info["gap"] = gap
+                self.second = info
+                return [("clap2", info)]
+        # Candidate first clap: needs a quiet moment before it.
+        if self._loud_between(t - QUIET_BEFORE_S, t, (t,)):
+            info["reason"] = "other sounds just before it — typing or talking?"
+            self.first = None
+            return [("rejected", info)]
+        self.first = info
+        self.second = None
+        return [("clap1", info)]
+
+    def feed(self, now: float, block: np.ndarray) -> list[tuple[str, dict]]:
+        block = block.reshape(-1)
+        peak = peak_mono(block)
+        th = self.threshold()
+        events: list[tuple[str, dict]] = []
+
+        if self.pending is not None:
+            p = self.pending
+            p["blocks"].append(block)
+            p["length"] = now - p["t"]
+            p["peak"] = max(p["peak"], peak)
+            if peak < max(th * RETRIGGER_RATIO, p["peak"] * CLAP_DECAY_RATIO):
+                self.pending = None
+                events += self._classify(p, too_long=False)
+            elif p["length"] > MAX_CLAP_LEN_S:
+                self.pending = None
+                events += self._classify(p, too_long=True)
+        elif self.armed and peak >= th:
+            self.armed = False
+            self.loud_onsets.append(now)
+            if self.second is not None:
+                # Something loud right after clap 2: a third clap, typing, music...
+                info = dict(self.second)
+                info["reason"] = "more sounds right after the second clap"
+                events.append(("rejected", info))
+                self.reset()
+            self.pending = {
+                "t": now,
+                "blocks": [self.prev_block, block],
+                "peak": peak,
+                "length": 0.0,
+                "threshold": th,
+            }
+        if not self.armed and self.pending is None and peak < th * RETRIGGER_RATIO:
+            self.armed = True
+        if self.pending is None:
+            self.history.append(peak)  # blocks outside a measured sound track the room noise
+
+        if self.second is not None and now - self.second["t"] >= QUIET_AFTER_S + self.second["length"]:
+            info = self.second
+            self.reset()
+            events.append(("double", info))
+        if self.first is not None and self.second is None and now - self.first["t"] > MAX_DOUBLE_GAP_S + MAX_CLAP_LEN_S:
+            self.first = None
+
+        self.prev_block = block
+        return events
+
+
+def _describe(info: dict) -> str:
+    return "peak %.3f, rms %.3f, %d%% high-pitched, %.0f ms wide, threshold %.3f" % (
+        info["peak"],
+        info["rms"],
+        int(100 * info["hf"]),
+        info["width_ms"],
+        info["threshold"],
+    )
 
 
 def main() -> int:
@@ -904,7 +1129,6 @@ def main() -> int:
     blocksize = block_samples()
     block_s = blocksize / SAMPLE_RATE
     detector = ClapDetector(block_s)
-    welcome_sequence_done = False
 
     if not IS_MAC:
         log.warning(
@@ -913,19 +1137,25 @@ def main() -> int:
             sys.platform,
         )
     if test_mode:
-        log.info("CLAP TEST MODE: nothing will open. Clap as often as you like; Ctrl+C to stop.")
+        log.info(
+            "CLAP TEST MODE: nothing will open and Jarvis keeps listening. "
+            "Clap as often as you like; Ctrl+C to stop."
+        )
+    else:
+        log.info(
+            "Jarvis will wait for ONE double clap, run the welcome once, then stop listening."
+        )
     log.info(
-        "Double clap = two claps %.1f–%.1fs apart. Sensitivity: clap must be %.1fx louder "
-        "than the room (JARVIS_SPIKE_RATIO). Ctrl+C to stop.",
+        "Double clap = two sharp claps %.2f–%.1fs apart. A clap must be %.1fx louder than "
+        "the room and at least %.2f peak (JARVIS_SPIKE_RATIO / JARVIS_MIN_CLAP_PEAK).",
         MIN_DOUBLE_GAP_S,
         MAX_DOUBLE_GAP_S,
         SPIKE_RATIO,
+        MIN_CLAP_PEAK,
     )
     if not test_mode:
         if SONG_URI.strip():
             log.info("Double clap plays this track: %s", SONG_URI.strip())
-        else:
-            log.info("JARVIS_SONG_URI is empty — set it to play one song on each double clap.")
         if OPEN_CLAUDE_CODE_IN_CHROME:
             log.info(
                 "Then open Claude in Chrome%s on display %d: %s",
@@ -950,8 +1180,7 @@ def main() -> int:
         if JARVIS_WELCOME_ENABLED:
             ev, em, ef, er = elevenlabs_env_config()
             log.info(
-                "After song + %.2fs: %r (ElevenLabs voice=%s, model=%s, format=%s, pcm_rate=%d)",
-                JARVIS_AFTER_SONG_DELAY_S,
+                "Then say: %r (ElevenLabs voice=%s, model=%s, format=%s, pcm_rate=%d)",
                 JARVIS_WELCOME_PHRASE.strip(),
                 ev or "(unset)",
                 em,
@@ -960,6 +1189,7 @@ def main() -> int:
             )
 
     input_idx = _choose_input_device(blocksize)
+    triggered: dict | None = None
 
     try:
         with sd.InputStream(
@@ -973,14 +1203,15 @@ def main() -> int:
             cal_rms: list[float] = []
             for _ in range(max(1, int(CALIBRATION_S / block_s))):
                 data, _ = stream.read(blocksize)
-                detector.calibrate(peak_mono(data))
+                detector.calibrate(data)
                 cal_rms.append(rms_mono(data))
             floor = detector.noise_floor()
             log.info(
-                "Room noise: peak %.4f (rms %.4f). Clap threshold set to peak %.4f.",
+                "Room noise: peak %.4f (rms %.4f). Clap threshold: peak %.3f%s.",
                 floor,
                 float(np.median(cal_rms)),
                 detector.threshold(),
+                " (minimum — quiet room)" if detector.threshold() <= MIN_CLAP_PEAK else "",
             )
             if floor * SPIKE_RATIO > MAX_CLAP_THRESHOLD:
                 log.warning(
@@ -992,61 +1223,42 @@ def main() -> int:
             log.info("Ready — clap twice.")
 
             window_max_peak = 0.0
-            window_max_rms = 0.0
             next_level_log = time.monotonic() + LEVEL_LOG_S
-            while True:
-                data, overflowed = stream.read(blocksize)
-                if overflowed:
-                    log.debug("Input overflow")
+            last_reject_log = 0.0
+            while triggered is None:
+                data, _ = stream.read(blocksize)
                 now = time.monotonic()
-                peak = peak_mono(data)
-                rms = rms_mono(data)
-                window_max_peak = max(window_max_peak, peak)
-                window_max_rms = max(window_max_rms, rms)
+                window_max_peak = max(window_max_peak, peak_mono(data))
 
-                event = detector.feed(now, peak, rms)
-                if event == "clap":
-                    log.info(
-                        "Clap 1 heard (peak %.3f, rms %.4f, threshold %.3f) — clap again "
-                        "within %.1fs...",
-                        peak,
-                        rms,
-                        detector.threshold(),
-                        MAX_DOUBLE_GAP_S,
-                    )
-                elif event == "double":
-                    log.info(
-                        "Clap 2 heard (peak %.3f, rms %.4f) — DOUBLE CLAP DETECTED!",
-                        peak,
-                        rms,
-                    )
-                    if test_mode:
-                        log.info("Test mode: would run the welcome now. Clap again to re-test.")
-                    elif welcome_sequence_done:
-                        log.info("Welcome already ran; restart Jarvis to run it again.")
-                    else:
-                        welcome_sequence_done = True
-                        log.info("Running welcome sequence.")
-                        threading.Thread(target=run_double_clap_actions, daemon=True).start()
+                for kind, info in detector.feed(now, data):
+                    if kind == "clap1":
+                        log.info("Clap 1 heard (%s) — clap again...", _describe(info))
+                    elif kind == "clap2":
+                        log.info(
+                            "Clap 2 heard after %.2fs (%s) — checking it's not part of other noise...",
+                            info["gap"],
+                            _describe(info),
+                        )
+                    elif kind == "rejected":
+                        if test_mode or now - last_reject_log >= 2.0:
+                            log.info("Ignored a sound: %s (%s)", info["reason"], _describe(info))
+                            last_reject_log = now
+                    elif kind == "double":
+                        log.info("DOUBLE CLAP DETECTED!")
+                        if test_mode:
+                            log.info("Test mode: the welcome would run now. Clap again to re-test.")
+                        else:
+                            triggered = info
 
                 if LEVEL_LOG_S > 0 and now >= next_level_log:
                     th = detector.threshold()
-                    hint = ""
-                    if th * 0.5 <= window_max_peak < th:
-                        hint = (
-                            " — a sound reached %d%% of the threshold; if that was a clap, "
-                            "lower JARVIS_SPIKE_RATIO" % int(100 * window_max_peak / th)
-                        )
                     log.info(
-                        "Level: room noise %.4f | loudest %.4f (rms %.4f) | clap threshold %.4f%s",
+                        "Level: room noise %.4f | loudest %.4f | clap threshold %.3f",
                         detector.noise_floor(),
                         window_max_peak,
-                        window_max_rms,
                         th,
-                        hint,
                     )
                     window_max_peak = 0.0
-                    window_max_rms = 0.0
                     next_level_log = now + LEVEL_LOG_S
 
     except KeyboardInterrupt:
@@ -1059,6 +1271,14 @@ def main() -> int:
             log.error("%s", MAC_MIC_HINT)
         return 1
 
+    # Production: the microphone is closed now; nothing else can trigger Jarvis.
+    log.info("Microphone closed — Jarvis is no longer listening. Running the welcome sequence...")
+    try:
+        run_double_clap_actions()
+    except KeyboardInterrupt:
+        log.info("Stopped.")
+        return 0
+    log.info("Welcome sequence finished. Jarvis has stopped. Run ./start_jarvis.sh to use it again.")
     return 0
 
 
