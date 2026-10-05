@@ -25,4 +25,4 @@ if [ ! -f .env ] && [ -f .env.example ]; then
   echo "Created .env from .env.example — open it to add your ElevenLabs key and voice ID."
 fi
 
-exec .venv/bin/python jarvis.py
+exec .venv/bin/python jarvis.py "$@"

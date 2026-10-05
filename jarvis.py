@@ -12,16 +12,21 @@ Run:
 Everything a user is likely to change can be set in a `.env` file next to this script
 (see `.env.example`). The constants below are only the defaults.
 
-Clap tuning (constants below):
+Clap detection:
+  Jarvis measures the room noise for a couple of seconds at startup and keeps re-measuring it
+  (median loudness of the last few seconds), so the clap threshold follows your room
+  automatically. A clap is a short, sharp sound whose peak is JARVIS_SPIKE_RATIO times louder
+  than the room noise; two claps 0.1–0.8 s apart trigger the welcome.
+  Run `./start_jarvis.sh --test` to only test claps (nothing opens, and you can clap repeatedly).
+  Every few seconds (JARVIS_LEVEL_LOG_S) a level line shows the room noise, the loudest recent
+  sound and the current clap threshold.
+
   SAMPLE_RATE   — usually 44100 or 48000; match your device if needed.
-  BLOCK_MS      — analysis window size; smaller = snappier, noisier.
-  SPIKE_RATIO   — how many times louder than the noise floor counts as a clap;
+  BLOCK_MS      — analysis window size (claps are only ~10 ms long, so keep it short).
+  SPIKE_RATIO   — how many times louder than the room noise a clap peak must be;
                     raise if false triggers; lower if claps are missed.
-  COOLDOWN_S    — minimum seconds between double-clap logs (debounce).
   MIN_DOUBLE_GAP_S / MAX_DOUBLE_GAP_S — allowed time between the two claps.
-  RETRIGGER_RATIO — audio must fall below threshold * this before another hit counts.
-  NOISE_FLOOR_ALPHA — closer to 1 = slower baseline adaptation to room noise.
-  MIN_RMS       — ignore spikes below this absolute level (float audio ~ [-1, 1]).
+  MIN_CLAP_PEAK / MAX_CLAP_THRESHOLD — absolute limits for the automatic threshold.
 
 Actions (macOS):
   SONG_URI      — Spotify or YouTube URL/URI (env JARVIS_SONG_URI). Spotify links are played in
@@ -59,6 +64,7 @@ import threading
 import time
 import wave
 import webbrowser
+from collections import deque
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -98,17 +104,21 @@ def _env_float(name: str, default: float) -> float:
 
 # --- tuning knobs -----------------------------------------------------------
 SAMPLE_RATE = _env_int("JARVIS_SAMPLE_RATE", 44100)
-BLOCK_MS = 40
+BLOCK_MS = 20
 CHANNELS = 1
 
-SPIKE_RATIO = _env_float("JARVIS_SPIKE_RATIO", 7.0)
-COOLDOWN_S = 0.45
-MIN_DOUBLE_GAP_S = 0.05
-MAX_DOUBLE_GAP_S = 0.35
-RETRIGGER_RATIO = 0.55
-NOISE_FLOOR_ALPHA = 0.992
-MIN_RMS = 0.012
-QUIET_GATE_MULT = 2.2  # update noise floor only when below floor * this
+# A clap's peak must be this many times the room-noise peak (auto-calibrated).
+SPIKE_RATIO = _env_float("JARVIS_SPIKE_RATIO", 4.0)
+COOLDOWN_S = 1.0  # after a double clap, ignore claps for this long
+MIN_DOUBLE_GAP_S = 0.1
+MAX_DOUBLE_GAP_S = _env_float("JARVIS_MAX_DOUBLE_GAP_S", 0.8)
+CLAP_REFRACTORY_S = 0.07  # a clap's own echo/decay is not a second clap
+RETRIGGER_RATIO = 0.6  # sound must fall below threshold * this before the next clap counts
+NOISE_WINDOW_S = 3.0  # room noise = median block peak over this many recent seconds
+CALIBRATION_S = 1.5  # measure the room before listening
+MIN_CLAP_PEAK = 0.03  # threshold never goes below this (full scale = 1.0)
+MAX_CLAP_THRESHOLD = 0.6  # ...or above this, so a loud clap still works in a noisy room
+LEVEL_LOG_S = _env_float("JARVIS_LEVEL_LOG_S", 5.0)  # 0 = no periodic level line
 # Startup mic probe: if default input RMS stays below this, scan for a louder device.
 INPUT_PROBE_S = 0.5
 INPUT_SILENT_RMS = 0.001
@@ -179,6 +189,12 @@ def rms_mono(block: np.ndarray) -> float:
     if block.size == 0:
         return 0.0
     return float(np.sqrt(np.mean(block**2)))
+
+
+def peak_mono(block: np.ndarray) -> float:
+    if block.size == 0:
+        return 0.0
+    return float(np.max(np.abs(block)))
 
 
 def _input_devices() -> list[tuple[int, dict]]:
@@ -828,12 +844,66 @@ def run_double_clap_actions() -> None:
     open_cursor_window()
 
 
+class ClapDetector:
+    """Detects double claps from per-block peak levels, with an adaptive noise floor.
+
+    The noise floor is the median block peak over the last NOISE_WINDOW_S seconds, so it
+    follows the room (fans, AC, traffic) and is barely moved by the claps themselves.
+    """
+
+    def __init__(self, block_s: float) -> None:
+        self.block_s = block_s
+        self.history: deque[float] = deque(maxlen=max(10, int(NOISE_WINDOW_S / block_s)))
+        self.armed = True
+        self.last_hit: float | None = None
+        self.first_clap: float | None = None
+        self.last_double = -1e9
+
+    def noise_floor(self) -> float:
+        return float(np.median(self.history)) if self.history else 0.0
+
+    def threshold(self) -> float:
+        return min(max(self.noise_floor() * SPIKE_RATIO, MIN_CLAP_PEAK), MAX_CLAP_THRESHOLD)
+
+    def calibrate(self, peak: float) -> None:
+        self.history.append(peak)
+
+    def feed(self, now: float, peak: float, rms: float) -> str | None:
+        """Process one block. Returns "clap", "double" or None."""
+        threshold = self.threshold()
+        event: str | None = None
+        if not self.armed and peak < threshold * RETRIGGER_RATIO:
+            if self.last_hit is None or now - self.last_hit >= CLAP_REFRACTORY_S:
+                self.armed = True
+        if self.armed and peak >= threshold:
+            self.armed = False
+            self.last_hit = now
+            if now - self.last_double < COOLDOWN_S:
+                pass
+            elif self.first_clap is not None and (
+                MIN_DOUBLE_GAP_S <= now - self.first_clap <= MAX_DOUBLE_GAP_S
+            ):
+                event = "double"
+                self.first_clap = None
+                self.last_double = now
+            elif self.first_clap is not None and now - self.first_clap < MIN_DOUBLE_GAP_S:
+                pass  # same clap ringing on
+            else:
+                event = "clap"
+                self.first_clap = now
+        else:
+            # Only quiet blocks update the room-noise estimate.
+            self.history.append(peak)
+        if self.first_clap is not None and now - self.first_clap > MAX_DOUBLE_GAP_S:
+            self.first_clap = None
+        return event
+
+
 def main() -> int:
+    test_mode = "--test" in sys.argv[1:] or _env_bool("JARVIS_TEST_MODE", False)
     blocksize = block_samples()
-    noise_floor = 1e-4
-    last_logged_double = 0.0
-    first_clap_time: float | None = None
-    spike_armed = True
+    block_s = blocksize / SAMPLE_RATE
+    detector = ClapDetector(block_s)
     welcome_sequence_done = False
 
     if not IS_MAC:
@@ -842,55 +912,54 @@ def main() -> int:
             "focus/fullscreen) is limited on %s.",
             sys.platform,
         )
+    if test_mode:
+        log.info("CLAP TEST MODE: nothing will open. Clap as often as you like; Ctrl+C to stop.")
     log.info(
-        "Listening (double clap: %.2f–%.2fs apart, rate=%d, block=%d ms, "
-        "spike_ratio=%.1f, cooldown=%.2fs). Ctrl+C to stop.",
+        "Double clap = two claps %.1f–%.1fs apart. Sensitivity: clap must be %.1fx louder "
+        "than the room (JARVIS_SPIKE_RATIO). Ctrl+C to stop.",
         MIN_DOUBLE_GAP_S,
         MAX_DOUBLE_GAP_S,
-        SAMPLE_RATE,
-        BLOCK_MS,
         SPIKE_RATIO,
-        COOLDOWN_S,
     )
-    if SONG_URI.strip():
-        log.info("Double clap plays this track: %s", SONG_URI.strip())
-    else:
-        log.info("JARVIS_SONG_URI is empty — set it to play one song on each double clap.")
-    if OPEN_CLAUDE_CODE_IN_CHROME:
-        log.info(
-            "Then open Claude in Chrome%s on display %d: %s",
-            " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
-            CLAUDE_CHROME_MONITOR,
-            CLAUDE_CODE_URL,
-        )
-    if OPEN_TASARADAR_IN_CHROME:
-        log.info(
-            "Then open Tasaradar in Chrome%s on display %d: %s",
-            " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
-            TASARADAR_CHROME_MONITOR,
-            TASARADAR_URL,
-        )
-    if FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP:
-        log.info(
-            "Then bring Cursor to the front (launching it if needed)%s.",
-            " in fullscreen" if CURSOR_OPEN_FULLSCREEN else "",
-        )
-    if OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
-        log.info("Double clap will also open a new Cursor window.")
-    if JARVIS_WELCOME_ENABLED:
-        ev, em, ef, er = elevenlabs_env_config()
-        log.info(
-            "After song + %.2fs: %r (ElevenLabs voice=%s, model=%s, format=%s, pcm_rate=%d)",
-            JARVIS_AFTER_SONG_DELAY_S,
-            JARVIS_WELCOME_PHRASE.strip(),
-            ev or "(unset)",
-            em,
-            ef,
-            er,
-        )
+    if not test_mode:
+        if SONG_URI.strip():
+            log.info("Double clap plays this track: %s", SONG_URI.strip())
+        else:
+            log.info("JARVIS_SONG_URI is empty — set it to play one song on each double clap.")
+        if OPEN_CLAUDE_CODE_IN_CHROME:
+            log.info(
+                "Then open Claude in Chrome%s on display %d: %s",
+                " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
+                CLAUDE_CHROME_MONITOR,
+                CLAUDE_CODE_URL,
+            )
+        if OPEN_TASARADAR_IN_CHROME:
+            log.info(
+                "Then open Tasaradar in Chrome%s on display %d: %s",
+                " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
+                TASARADAR_CHROME_MONITOR,
+                TASARADAR_URL,
+            )
+        if FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP:
+            log.info(
+                "Then bring Cursor to the front (launching it if needed)%s.",
+                " in fullscreen" if CURSOR_OPEN_FULLSCREEN else "",
+            )
+        if OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
+            log.info("Double clap will also open a new Cursor window.")
+        if JARVIS_WELCOME_ENABLED:
+            ev, em, ef, er = elevenlabs_env_config()
+            log.info(
+                "After song + %.2fs: %r (ElevenLabs voice=%s, model=%s, format=%s, pcm_rate=%d)",
+                JARVIS_AFTER_SONG_DELAY_S,
+                JARVIS_WELCOME_PHRASE.strip(),
+                ev or "(unset)",
+                em,
+                ef,
+                er,
+            )
 
     input_idx = _choose_input_device(blocksize)
-    log.info("Ready — clap twice.")
 
     try:
         with sd.InputStream(
@@ -900,57 +969,85 @@ def main() -> int:
             dtype="float32",
             blocksize=blocksize,
         ) as stream:
+            log.info("Measuring room noise for %.1fs — please stay quiet...", CALIBRATION_S)
+            cal_rms: list[float] = []
+            for _ in range(max(1, int(CALIBRATION_S / block_s))):
+                data, _ = stream.read(blocksize)
+                detector.calibrate(peak_mono(data))
+                cal_rms.append(rms_mono(data))
+            floor = detector.noise_floor()
+            log.info(
+                "Room noise: peak %.4f (rms %.4f). Clap threshold set to peak %.4f.",
+                floor,
+                float(np.median(cal_rms)),
+                detector.threshold(),
+            )
+            if floor * SPIKE_RATIO > MAX_CLAP_THRESHOLD:
+                log.warning(
+                    "The room (or mic gain) is very loud; claps need to be close and sharp. "
+                    "Lower the input volume in System Settings → Sound → Input if possible."
+                )
+            elif floor < 1e-5:
+                log.warning("The microphone is completely silent. %s", MAC_MIC_HINT)
+            log.info("Ready — clap twice.")
+
+            window_max_peak = 0.0
+            window_max_rms = 0.0
+            next_level_log = time.monotonic() + LEVEL_LOG_S
             while True:
                 data, overflowed = stream.read(blocksize)
                 if overflowed:
-                    log.warning("Input overflow; try a larger BLOCK_MS")
-
-                level = rms_mono(data)
-
-                quiet_gate = noise_floor * QUIET_GATE_MULT
-                if level < quiet_gate:
-                    noise_floor = NOISE_FLOOR_ALPHA * noise_floor + (
-                        1.0 - NOISE_FLOOR_ALPHA
-                    ) * level
-                    noise_floor = max(noise_floor, 1e-7)
-
-                threshold = max(noise_floor * SPIKE_RATIO, MIN_RMS)
+                    log.debug("Input overflow")
                 now = time.monotonic()
-                retrigger_level = threshold * RETRIGGER_RATIO
+                peak = peak_mono(data)
+                rms = rms_mono(data)
+                window_max_peak = max(window_max_peak, peak)
+                window_max_rms = max(window_max_rms, rms)
 
-                if level < retrigger_level:
-                    spike_armed = True
-
-                if (
-                    spike_armed
-                    and level >= threshold
-                    and (now - last_logged_double) >= COOLDOWN_S
-                ):
-                    spike_armed = False
-                    if first_clap_time is None:
-                        first_clap_time = now
+                event = detector.feed(now, peak, rms)
+                if event == "clap":
+                    log.info(
+                        "Clap 1 heard (peak %.3f, rms %.4f, threshold %.3f) — clap again "
+                        "within %.1fs...",
+                        peak,
+                        rms,
+                        detector.threshold(),
+                        MAX_DOUBLE_GAP_S,
+                    )
+                elif event == "double":
+                    log.info(
+                        "Clap 2 heard (peak %.3f, rms %.4f) — DOUBLE CLAP DETECTED!",
+                        peak,
+                        rms,
+                    )
+                    if test_mode:
+                        log.info("Test mode: would run the welcome now. Clap again to re-test.")
+                    elif welcome_sequence_done:
+                        log.info("Welcome already ran; restart Jarvis to run it again.")
                     else:
-                        gap = now - first_clap_time
-                        if gap < MIN_DOUBLE_GAP_S:
-                            pass
-                        elif gap <= MAX_DOUBLE_GAP_S:
-                            first_clap_time = None
-                            last_logged_double = now
-                            if not welcome_sequence_done:
-                                welcome_sequence_done = True
-                                log.info(
-                                    "Double clap detected (gap=%.3fs, rms=%.5f, "
-                                    "noise_floor=%.5f, threshold=%.5f) — running welcome once",
-                                    gap,
-                                    level,
-                                    noise_floor,
-                                    threshold,
-                                )
-                                threading.Thread(
-                                    target=run_double_clap_actions, daemon=True
-                                ).start()
-                        else:
-                            first_clap_time = now
+                        welcome_sequence_done = True
+                        log.info("Running welcome sequence.")
+                        threading.Thread(target=run_double_clap_actions, daemon=True).start()
+
+                if LEVEL_LOG_S > 0 and now >= next_level_log:
+                    th = detector.threshold()
+                    hint = ""
+                    if th * 0.5 <= window_max_peak < th:
+                        hint = (
+                            " — a sound reached %d%% of the threshold; if that was a clap, "
+                            "lower JARVIS_SPIKE_RATIO" % int(100 * window_max_peak / th)
+                        )
+                    log.info(
+                        "Level: room noise %.4f | loudest %.4f (rms %.4f) | clap threshold %.4f%s",
+                        detector.noise_floor(),
+                        window_max_peak,
+                        window_max_rms,
+                        th,
+                        hint,
+                    )
+                    window_max_peak = 0.0
+                    window_max_rms = 0.0
+                    next_level_log = now + LEVEL_LOG_S
 
     except KeyboardInterrupt:
         log.info("Stopped.")
