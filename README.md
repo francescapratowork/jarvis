@@ -59,7 +59,8 @@ open -e ~/jarvis/.env
 | `CURSOR_OPEN_FULLSCREEN` | `true` puts Cursor in fullscreen. | `true` |
 | `FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP` / `OPEN_NEW_CURSOR_ON_DOUBLE_CLAP` | Bring Cursor forward / also open a new Cursor window. | `true` / `false` |
 | `JARVIS_INPUT_DEVICE` | Force a microphone by name (e.g. `MacBook Pro Microphone`) or number. | your default mic |
-| `JARVIS_MIN_CLAP_PEAK` | The quietest a clap may be (0–1), however quiet the room. Raise (e.g. `0.25`) if other sounds still trigger it; lower (e.g. `0.1`) if your claps are ignored. | `0.15` |
+| `JARVIS_MIN_CLAP_PEAK` | The quietest peak a clap may have, however quiet the room. | `0.15` |
+| `JARVIS_MIN_CLAP_RMS` | The least energy (`rms`) a clap may have. This is what separates claps from clicks, taps and keys. Raise (e.g. `0.5`) if other sounds still trigger it; lower (e.g. `0.15`) if your claps show `too little energy`. | `0.3` |
 | `JARVIS_SPIKE_RATIO` | How many times louder than the room a clap must be. Lower = more sensitive. | `5.0` |
 | `JARVIS_MAX_DOUBLE_GAP_S` | Longest pause allowed between the two claps, in seconds. | `0.8` |
 | `JARVIS_LEVEL_LOG_S` | How often the live sound-level line is printed (seconds, `0` = off). | `5` |
@@ -98,17 +99,17 @@ cd ~/jarvis
 In test mode Jarvis keeps listening, so you can clap as often as you like and watch the Terminal:
 
 ```
-Room noise: peak 0.0500 (rms 0.0150). Clap threshold: peak 0.250.
+Room noise: peak 0.0500 (rms 0.0150). A clap needs peak ≥ 0.250 and rms ≥ 0.300.
 Ready — clap twice.
-Ignored a sound: too thin — a click, tap or key press? (peak 0.412, rms 0.031, 97% high-pitched, 2 ms wide, threshold 0.250)
-Clap 1 heard (peak 0.425, rms 0.062, 93% high-pitched, 10 ms wide, threshold 0.252) — clap again...
-Clap 2 heard after 0.30s (peak 0.473, rms 0.062, 96% high-pitched, 11 ms wide, threshold 0.252) — checking it's not part of other noise...
+Ignored a sound: too little energy — a click, tap or key press? (peak 1.012, rms 0.079 (need 0.300), 98% high-pitched, 2 ms wide, threshold 0.250)
+Clap 1 heard (peak 14.985, rms 1.401 (need 0.300), 85% high-pitched, 3 ms wide, threshold 0.252) — clap again...
+Clap 2 heard after 0.30s (peak 14.985, rms 1.275 (need 0.301), 78% high-pitched, 3 ms wide, threshold 0.253) — checking it's not part of other noise...
 DOUBLE CLAP DETECTED!
 Level: room noise 0.0512 | loudest 0.4730 | clap threshold 0.252
 ```
 
-- **Clap 1 / Clap 2 heard**: a clap was recognised, with its measured loudness (peak, rms), pitch and length.
-- **Ignored a sound**: something loud that is *not* a clap, and why: a click or key press (too short), a voice or thump (too low-pitched), music or talking (too long), or other noise right before or after.
+- **Clap 1 / Clap 2 heard**: a clap was recognised, with its measured peak, energy (`rms`, and the minimum needed), pitch and width. On a MacBook, real claps measure about peak 10–18 and rms 1.1–2.3.
+- **Ignored a sound**: something loud that is *not* a clap, and why: a click or key press (too little energy), a voice or thump (too low-pitched), music or talking (too long), or other noise right before or after.
 - **Level** (every 5 seconds): room noise, the loudest recent sound, and how loud a clap must be.
 - Jarvis only accepts two claps with silence around them, so typing, talking or music between or right after the claps cancels them.
 
@@ -126,19 +127,19 @@ If you click "Don't Allow" by mistake, turn it back on in **System Settings → 
 
 ## Tuning
 
-The threshold adapts to your room but never drops below `JARVIS_MIN_CLAP_PEAK` (0.15), so a quiet room can't make Jarvis jumpy. If you need to tune it, run `--test` and compare the `peak` of your claps with the threshold:
+The threshold adapts to your room but never drops below `JARVIS_MIN_CLAP_PEAK` (0.15) and `JARVIS_MIN_CLAP_RMS` (0.3), so a quiet room can't make Jarvis jumpy. If you need to tune it, run `--test` and compare the `rms` of your claps and other sounds with the `need` value:
 
-- Claps show up as `Ignored`, or not at all → lower `JARVIS_MIN_CLAP_PEAK` (e.g. `0.1`) or `JARVIS_SPIKE_RATIO` (e.g. `4`).
-- Other sounds show up as `Clap 1 heard` → raise `JARVIS_MIN_CLAP_PEAK` (e.g. `0.25`).
+- Claps show up as `too little energy` → lower `JARVIS_MIN_CLAP_RMS` (keep it well above what your clicks and typing show).
+- Other sounds show up as `Clap 1 heard` → raise `JARVIS_MIN_CLAP_RMS` (keep it well below what your claps show).
 
-Advanced shape checks (`MIN_CLAP_WIDTH_MS`, `MIN_HF_RATIO`, `MAX_CLAP_LEN_S`, `QUIET_BEFORE_S`, `QUIET_AFTER_S`, …) are at the top of `jarvis.py`.
+Advanced shape checks (`CLAP_RMS_RATIO`, `MIN_HF_RATIO`, `MAX_CLAP_LEN_S`, `QUIET_BEFORE_S`, `QUIET_AFTER_S`, …) are at the top of `jarvis.py`.
 
 ## Troubleshooting
 
 - **"Every microphone sounds silent":** Microphone permission is off. Turn on Terminal in **System Settings → Privacy & Security → Microphone**, quit Terminal with Cmd+Q, and start again.
 - **Wrong mic:** Jarvis prints the list of audio devices on startup. Put the name (or number) of the one you want in `JARVIS_INPUT_DEVICE`.
 - **No reaction to claps:** Run `./start_jarvis.sh --test` and see the Tuning section. If `Clap 1` appears but never `Clap 2`, clap a bit faster (within 0.8 s) and keep quiet right after.
-- **Triggers on other sounds:** Raise `JARVIS_MIN_CLAP_PEAK` (e.g. `0.25`).
+- **Triggers on other sounds:** Raise `JARVIS_MIN_CLAP_RMS` (e.g. `0.5`).
 - **"The room (or mic gain) is very loud":** Lower the input volume in **System Settings → Sound → Input**.
 - **No music:** Look for the `Spotify:` lines in Terminal. They say `SUCCESS` with the song name, or what went wrong:
   - *did not allow Jarvis to control Spotify*: turn on Spotify under **System Settings → Privacy & Security → Automation → Terminal**, quit Terminal (Cmd+Q), start again.

@@ -16,9 +16,10 @@ Clap detection:
   Production: calibrate → wait for ONE valid double clap → close the microphone → run the
   welcome once → exit. `./start_jarvis.sh --test` keeps listening and only logs claps.
   The threshold is room noise × JARVIS_SPIKE_RATIO (re-measured continuously), but never below
-  JARVIS_MIN_CLAP_PEAK. Each loud sound is then checked for clap shape (short, ≥5 ms wide,
-  bright) and the two claps must be 0.15–0.8 s apart with quiet around them, which rejects
-  speech, typing, clicks and music. Every decision is logged with its measurements.
+  JARVIS_MIN_CLAP_PEAK. Each loud sound is then checked: short (voice/music last longer),
+  energetic (40 ms rms ≥ JARVIS_MIN_CLAP_RMS; clicks/keys are thin), bright (voices/thumps
+  are low-pitched). The two claps must be 0.15–0.8 s apart with quiet around them, which
+  rejects typing and repeated noises. Every decision is logged with its measurements.
 
   SAMPLE_RATE   — usually 44100 or 48000; match your device if needed.
   BLOCK_MS      — analysis window size (claps are only ~10 ms long, so keep it short).
@@ -26,7 +27,7 @@ Clap detection:
                     raise if false triggers; lower if claps are missed.
   MIN_DOUBLE_GAP_S / MAX_DOUBLE_GAP_S — allowed time between the two claps.
   MIN_CLAP_PEAK / MAX_CLAP_THRESHOLD — absolute limits for the automatic threshold.
-  MIN_CLAP_WIDTH_MS / MIN_HF_RATIO / MAX_CLAP_LEN_S / QUIET_BEFORE_S / QUIET_AFTER_S — clap shape
+  MIN_CLAP_RMS / CLAP_RMS_RATIO / MIN_HF_RATIO / MAX_CLAP_LEN_S / QUIET_BEFORE_S / QUIET_AFTER_S — clap shape
                     and isolation checks.
 
 Actions (macOS):
@@ -118,13 +119,21 @@ MIN_CLAP_PEAK = _env_float("JARVIS_MIN_CLAP_PEAK", 0.15)
 MAX_CLAP_THRESHOLD = 0.6  # cap, so a loud clap still works in a noisy room
 MIN_DOUBLE_GAP_S = 0.15
 MAX_DOUBLE_GAP_S = _env_float("JARVIS_MAX_DOUBLE_GAP_S", 0.8)
-RETRIGGER_RATIO = 0.6  # sound must fall below threshold * this before the next sound counts
-# Shape checks that tell a clap from other sounds:
+RETRIGGER_RATIO = 0.6  # a sound has ended once below threshold * this (or its own decay)
+ONSET_RISE = 3.0  # a new sound must be this many times louder than the previous 20 ms,
+#                   so a loud clap's echo/decay is never mistaken for a new sound
+# Shape checks that tell a clap from other sounds. Tuned on real MacBook claps, which measured
+# peak 10.7-18.1, rms 1.16-2.34 (40 ms), 45-90% above 1 kHz, but only 2-3 ms "wide": a clap is
+# a very sharp spike followed by a quieter body, so width is NOT a usable test on this mic.
 MAX_CLAP_LEN_S = 0.2  # claps die away fast; longer sounds are voice/music
 CLAP_DECAY_RATIO = 0.3  # "died away" = block peak below this fraction of the clap's peak
-MIN_CLAP_RMS = 0.02  # energy over 40 ms around the peak; clicks/taps are thinner
-MIN_CLAP_WIDTH_MS = 5.0  # time the sound stays above 30% of its peak; clicks/keys ~2-4 ms
-MIN_HF_RATIO = 0.4  # share of energy above 1 kHz; voices and thumps are lower-pitched
+# Energy test ("too little energy"): rms over 40 ms around the peak must reach
+# max(JARVIS_MIN_CLAP_RMS, CLAP_RMS_RATIO x room rms). The 0.3 floor is about 4x below the
+# weakest real clap measured (1.16) and does not drop in a quiet room, because claps don't
+# get quieter when the room does; clicks, taps and keys carry far less energy.
+MIN_CLAP_RMS = _env_float("JARVIS_MIN_CLAP_RMS", 0.3)
+CLAP_RMS_RATIO = _env_float("JARVIS_CLAP_RMS_RATIO", 20.0)
+MIN_HF_RATIO = 0.3  # share of energy above 1 kHz; voices and thumps are lower-pitched
 QUIET_BEFORE_S = 0.4  # no other loud sound just before clap 1 (rejects typing/speech)
 QUIET_AFTER_S = 0.35  # ...nor just after clap 2
 NOISE_WINDOW_S = 3.0  # room noise = median block peak over this many recent seconds
@@ -967,13 +976,15 @@ def _hf_ratio(seg: np.ndarray) -> float:
 class ClapDetector:
     """Detects a double clap and rejects speech, typing, clicks and music.
 
-    Every loud onset (block peak over the threshold) is recorded. Once it dies away it is
-    checked: a clap is short (< MAX_CLAP_LEN_S), full-bodied (RMS around the peak) and
-    bright (energy above 1 kHz). A double clap is two such claps MIN–MAX_DOUBLE_GAP_S apart,
-    of similar loudness, with no other loud sound shortly before, between, or after them.
+    A loud onset is a block whose peak is over the threshold AND ONSET_RISE times louder
+    than the previous block (so decaying echoes never start a new sound). Once it dies away
+    it is checked: a clap is short (< MAX_CLAP_LEN_S), energetic (40 ms RMS well above the
+    room's RMS) and bright (energy above 1 kHz). A double clap is two such claps
+    MIN–MAX_DOUBLE_GAP_S apart, of similar loudness, with no other loud onset shortly
+    before, between, or after them.
 
-    The threshold is room noise × SPIKE_RATIO (room noise = median block peak of quiet
-    blocks over the last NOISE_WINDOW_S), clamped to [MIN_CLAP_PEAK, MAX_CLAP_THRESHOLD].
+    The peak threshold is room noise × SPIKE_RATIO (room noise = median block peak over the
+    last NOISE_WINDOW_S), clamped to [MIN_CLAP_PEAK, MAX_CLAP_THRESHOLD].
 
     feed() returns a list of (kind, info) events: "clap1", "clap2", "double",
     "rejected" (info["reason"]).
@@ -981,8 +992,10 @@ class ClapDetector:
 
     def __init__(self, block_s: float) -> None:
         self.block_s = block_s
-        self.history: deque[float] = deque(maxlen=max(10, int(NOISE_WINDOW_S / block_s)))
-        self.armed = True
+        n = max(10, int(NOISE_WINDOW_S / block_s))
+        self.history: deque[float] = deque(maxlen=n)  # block peaks
+        self.rms_history: deque[float] = deque(maxlen=n)  # block RMS
+        self.prev_peak = 0.0
         self.prev_block: np.ndarray = np.zeros(0, dtype=np.float32)
         self.pending: dict | None = None  # the loud sound currently being measured
         self.loud_onsets: deque[float] = deque(maxlen=64)
@@ -995,9 +1008,18 @@ class ClapDetector:
     def threshold(self) -> float:
         return min(max(self.noise_floor() * SPIKE_RATIO, MIN_CLAP_PEAK), MAX_CLAP_THRESHOLD)
 
+    def room_rms(self) -> float:
+        return float(np.median(self.rms_history)) if self.rms_history else 0.0
+
+    def min_clap_rms(self) -> float:
+        return max(MIN_CLAP_RMS, CLAP_RMS_RATIO * self.room_rms())
+
     def calibrate(self, block: np.ndarray) -> None:
+        block = block.reshape(-1)
         self.history.append(peak_mono(block))
-        self.prev_block = block.reshape(-1)
+        self.rms_history.append(rms_mono(block))
+        self.prev_block = block
+        self.prev_peak = self.history[-1]
 
     def reset(self) -> None:
         self.first = None
@@ -1025,6 +1047,7 @@ class ClapDetector:
             "hf": _hf_ratio(seg),
             "length": p["length"],
             "threshold": p["threshold"],
+            "min_rms": p["min_rms"],
         }
 
     def _classify(self, p: dict, too_long: bool) -> list[tuple[str, dict]]:
@@ -1032,8 +1055,8 @@ class ClapDetector:
         reason = ""
         if too_long:
             reason = "lasted too long — voice or music?"
-        elif info["rms"] < MIN_CLAP_RMS or info["width_ms"] < MIN_CLAP_WIDTH_MS:
-            reason = "too thin — a click, tap or key press?"
+        elif info["rms"] < info["min_rms"]:
+            reason = "too little energy — a click, tap or key press?"
         elif info["hf"] < MIN_HF_RATIO:
             reason = "too low-pitched — voice or a thump?"
         if reason:
@@ -1082,8 +1105,7 @@ class ClapDetector:
             elif p["length"] > MAX_CLAP_LEN_S:
                 self.pending = None
                 events += self._classify(p, too_long=True)
-        elif self.armed and peak >= th:
-            self.armed = False
+        elif peak >= th and peak >= ONSET_RISE * self.prev_peak:
             self.loud_onsets.append(now)
             if self.second is not None:
                 # Something loud right after clap 2: a third clap, typing, music...
@@ -1097,11 +1119,12 @@ class ClapDetector:
                 "peak": peak,
                 "length": 0.0,
                 "threshold": th,
+                "min_rms": self.min_clap_rms(),
             }
-        if not self.armed and self.pending is None and peak < th * RETRIGGER_RATIO:
-            self.armed = True
         if self.pending is None:
-            self.history.append(peak)  # blocks outside a measured sound track the room noise
+            # Blocks outside a measured sound track the room noise.
+            self.history.append(peak)
+            self.rms_history.append(rms_mono(block))
 
         if self.second is not None and now - self.second["t"] >= QUIET_AFTER_S + self.second["length"]:
             info = self.second
@@ -1111,13 +1134,15 @@ class ClapDetector:
             self.first = None
 
         self.prev_block = block
+        self.prev_peak = peak
         return events
 
 
 def _describe(info: dict) -> str:
-    return "peak %.3f, rms %.3f, %d%% high-pitched, %.0f ms wide, threshold %.3f" % (
+    return "peak %.3f, rms %.3f (need %.3f), %d%% high-pitched, %.0f ms wide, threshold %.3f" % (
         info["peak"],
         info["rms"],
+        info["min_rms"],
         int(100 * info["hf"]),
         info["width_ms"],
         info["threshold"],
@@ -1207,11 +1232,12 @@ def main() -> int:
                 cal_rms.append(rms_mono(data))
             floor = detector.noise_floor()
             log.info(
-                "Room noise: peak %.4f (rms %.4f). Clap threshold: peak %.3f%s.",
+                "Room noise: peak %.4f (rms %.4f). A clap needs peak ≥ %.3f%s and rms ≥ %.3f.",
                 floor,
                 float(np.median(cal_rms)),
                 detector.threshold(),
                 " (minimum — quiet room)" if detector.threshold() <= MIN_CLAP_PEAK else "",
+                detector.min_clap_rms(),
             )
             if floor * SPIKE_RATIO > MAX_CLAP_THRESHOLD:
                 log.warning(
