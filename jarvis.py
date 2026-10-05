@@ -675,6 +675,8 @@ def _spotify_try_play(command: str, attempts: int) -> tuple[str, list[str]]:
     volume = ""
     if SPOTIFY_VOLUME.isdigit():
         volume = f"set sound volume to {max(0, min(100, int(SPOTIFY_VOLUME)))}"
+    # Note: AppleScript reserves short words such as st/nd/rd/th (ordinal suffixes, "1st"),
+    # so variables here use long descriptive names.
     script = f"""
 set lastErr to ""
 repeat {attempts} times
@@ -686,8 +688,8 @@ repeat {attempts} times
     delay 1
     tell application "Spotify"
       if player state is playing then
-        set t to current track
-        return "ok|" & (name of t) & "|" & (artist of t) & "|" & (sound volume as text)
+        set nowPlaying to current track
+        return "ok|" & (name of nowPlaying) & "|" & (artist of nowPlaying) & "|" & (sound volume as text)
       end if
     end tell
   on error errMsg number errNum
@@ -696,11 +698,11 @@ repeat {attempts} times
   end try
   delay 0.5
 end repeat
-set st to "unknown"
+set playerStateText to "unknown"
 try
-  tell application "Spotify" to set st to (player state as text)
+  tell application "Spotify" to set playerStateText to (player state as text)
 end try
-return "notplaying|" & st & "|" & lastErr
+return "notplaying|" & playerStateText & "|" & lastErr
 """
     ok, out, err = _osascript(script, timeout=attempts * 2.0 + 30)
     if not ok:
