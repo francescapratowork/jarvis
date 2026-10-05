@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Desktop clap listener: reads the default microphone and logs when two loud transients
-(a double clap) are detected within a short time window.
+Jarvis for macOS: listens to your Mac microphone and, on a double clap, runs a welcome
+sequence (Spotify track, Chrome windows, ElevenLabs voice, Cursor).
 
 Run:
-  python -m pip install -r requirements.txt
-  python clap_listen.py
+  ./start_jarvis.sh            (first run creates a virtualenv and installs dependencies)
+  # or manually:
+  python3 -m pip install -r requirements.txt
+  python3 jarvis.py
 
-Tuning (constants below):
+Everything a user is likely to change can be set in a `.env` file next to this script
+(see `.env.example`). The constants below are only the defaults.
+
+Clap tuning (constants below):
   SAMPLE_RATE   — usually 44100 or 48000; match your device if needed.
   BLOCK_MS      — analysis window size; smaller = snappier, noisier.
   SPIKE_RATIO   — how many times louder than the noise floor counts as a clap;
@@ -17,31 +22,35 @@ Tuning (constants below):
   RETRIGGER_RATIO — audio must fall below threshold * this before another hit counts.
   NOISE_FLOOR_ALPHA — closer to 1 = slower baseline adaptation to room noise.
   MIN_RMS       — ignore spikes below this absolute level (float audio ~ [-1, 1]).
-  SONG_URI      — Spotify or YouTube URL/URI to open on each double clap (empty = log only).
-  FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP — if True, launch Cursor without -n (reuse / focus existing instance).
-  OPEN_NEW_CURSOR_ON_DOUBLE_CLAP — if True, also launch Cursor with -n (extra new window; runs after focus launch if both).
-  CURSOR_OPEN_FULLSCREEN — Windows: after focus/launch, send F11 to enter Cursor/VS Code-style fullscreen (toggle off with F11).
-  OPEN_CLAUDE_CODE_IN_CHROME — Claude in Chrome after Spotify (CLAUDE_CODE_URL).
-  OPEN_BINANCE_BTC_IN_CHROME — Binance BTC trade page in Chrome (BINANCE_BTC_URL).
-  CLAUDE_CHROME_MONITOR / BINANCE_CHROME_MONITOR — 1-based display index (Windows: sorted left-to-top).
-  CHROME_SEPARATE_SITE_PROFILES — Windows: if True, uses temp --user-data-dir per site (not your normal profile).
-    Default False so Claude/Binance use your usual Chrome profile and logins; enable only if both windows keep
-    opening on the same monitor and you accept a separate profile for automation.
-  OPEN_CHROME_FULLSCREEN — Fullscreen on the chosen monitor (Windows: new window is detected and snapped with SetWindowPos).
-  JARVIS_WELCOME_* — TTS after the song (ElevenLabs). Configure via environment or a `.env`
-    file next to this script (ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, etc.).
+
+Actions (macOS):
+  SONG_URI      — Spotify or YouTube URL/URI (env JARVIS_SONG_URI). Spotify links are played in
+                    the Spotify app via AppleScript; anything else opens in the default browser.
+  OPEN_CLAUDE_CODE_IN_CHROME / OPEN_TASARADAR_IN_CHROME — open each site in a new Chrome window
+    (CLAUDE_CODE_URL / TASARADAR_URL), placed on CLAUDE_CHROME_MONITOR / TASARADAR_CHROME_MONITOR
+    (1-based, displays sorted left-to-right then top-to-bottom).
+  OPEN_CHROME_FULLSCREEN / CURSOR_OPEN_FULLSCREEN — native macOS fullscreen (needs Accessibility
+    permission for your Terminal app). Without that permission the window just fills the screen.
+  CHROME_SEPARATE_SITE_PROFILES — if True, uses a temp --user-data-dir per site (not your normal
+    profile). Default False so Claude/Tasaradar use your usual Chrome profile and logins.
+  FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP — bring Cursor to the front (launches it if not running).
+  OPEN_NEW_CURSOR_ON_DOUBLE_CLAP — also open a new Cursor window.
+  JARVIS_WELCOME_* — TTS after the song (ElevenLabs), played through the default output device.
     With JARVIS_WELCOME_CACHE_ENABLED, audio is saved under `.cache/jarvis_welcome/` (WAV) and
     replayed when phrase + voice + model + format match—no repeat API call. Delete that folder
-    or set JARVIS_WELCOME_CACHE_ENABLED=False to force a fresh fetch.
+    or set JARVIS_WELCOME_CACHE_ENABLED=false to force a fresh fetch.
   The welcome sequence runs only once per process. The assistant speaks in the background so Cursor
     opens without waiting for playback to finish (restart the script to run again).
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -56,12 +65,43 @@ from dotenv import load_dotenv
 import numpy as np
 import sounddevice as sd
 
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+IS_MAC = sys.platform == "darwin"
+
+
+def _env_str(name: str, default: str = "") -> str:
+    v = (os.environ.get(name) or "").strip()
+    return v if v else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_env_str(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env_str(name, str(default)))
+    except ValueError:
+        return default
+
+
 # --- tuning knobs -----------------------------------------------------------
-SAMPLE_RATE = 44100
+SAMPLE_RATE = _env_int("JARVIS_SAMPLE_RATE", 44100)
 BLOCK_MS = 40
 CHANNELS = 1
 
-SPIKE_RATIO = 7.0
+SPIKE_RATIO = _env_float("JARVIS_SPIKE_RATIO", 7.0)
 COOLDOWN_S = 0.45
 MIN_DOUBLE_GAP_S = 0.05
 MAX_DOUBLE_GAP_S = 0.35
@@ -75,43 +115,55 @@ INPUT_SILENT_RMS = 0.001
 
 # Spotify: "spotify:track:TRACK_ID" or https://open.spotify.com/track/...
 # YouTube: https://www.youtube.com/watch?v=...
-SONG_URI = "https://open.spotify.com/track/39shmbIHICJ2Wxnk1fPSdz?si=2900c75c2e2d4b82"
+SONG_URI = _env_str(
+    "JARVIS_SONG_URI",
+    "https://open.spotify.com/track/39shmbIHICJ2Wxnk1fPSdz?si=2900c75c2e2d4b82",
+)
+# Optional Spotify volume (0–100) set before playing; empty = leave unchanged.
+SPOTIFY_VOLUME = _env_str("SPOTIFY_VOLUME")
 
-# Cursor: focus existing instance (no -n). Set OPEN_NEW_CURSOR_ON_DOUBLE_CLAP for a new window as well.
-FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP = True
-OPEN_NEW_CURSOR_ON_DOUBLE_CLAP = False
-CURSOR_OPEN_FULLSCREEN = True
+# Cursor: bring existing instance to the front. Set OPEN_NEW_CURSOR_ON_DOUBLE_CLAP for a new window as well.
+FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP = _env_bool("FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP", True)
+OPEN_NEW_CURSOR_ON_DOUBLE_CLAP = _env_bool("OPEN_NEW_CURSOR_ON_DOUBLE_CLAP", False)
+CURSOR_OPEN_FULLSCREEN = _env_bool("CURSOR_OPEN_FULLSCREEN", True)
 
 # Google Chrome (fallback: default browser). URLs overridable in .env.
-OPEN_CLAUDE_CODE_IN_CHROME = True
-OPEN_BINANCE_BTC_IN_CHROME = True
-OPEN_CHROME_FULLSCREEN = True
-# False = default Chrome profile (your normal user, extensions, cookies). True = temp dirs under %TEMP% per site.
-CHROME_SEPARATE_SITE_PROFILES = False
-# Which physical screen (1 = leftmost/top-first after sorting). Windows only; ignored elsewhere.
-CLAUDE_CHROME_MONITOR = 1
-BINANCE_CHROME_MONITOR = 3
+CLAUDE_CODE_URL = _env_str("CLAUDE_CODE_URL", "https://claude.ai/new")
+# TASARADAR_URL wins; BINANCE_BTC_URL is still honoured as a fallback for older .env files.
+TASARADAR_URL = _env_str("TASARADAR_URL") or _env_str("BINANCE_BTC_URL") or "https://tasaradar.com"
+OPEN_CLAUDE_CODE_IN_CHROME = _env_bool("OPEN_CLAUDE_CODE_IN_CHROME", True)
+OPEN_TASARADAR_IN_CHROME = _env_bool(
+    "OPEN_TASARADAR_IN_CHROME", _env_bool("OPEN_BINANCE_BTC_IN_CHROME", True)
+)
+OPEN_CHROME_FULLSCREEN = _env_bool("OPEN_CHROME_FULLSCREEN", True)
+# False = default Chrome profile (your normal user, extensions, cookies). True = temp dirs per site.
+CHROME_SEPARATE_SITE_PROFILES = _env_bool("CHROME_SEPARATE_SITE_PROFILES", False)
+# Which display (1 = leftmost/top-first after sorting). Falls back to the last display if absent.
+CLAUDE_CHROME_MONITOR = _env_int("CLAUDE_CHROME_MONITOR", 1)
+TASARADAR_CHROME_MONITOR = _env_int(
+    "TASARADAR_CHROME_MONITOR", _env_int("BINANCE_CHROME_MONITOR", 3)
+)
 
-JARVIS_WELCOME_ENABLED = True
-JARVIS_WELCOME_PHRASE = (
-    "Welcome home sir. "
-    "Congratulations on the new client for your SaaS app—make sure to follow up. "
-    "If it helps: a short, specific note while the deal is still fresh usually "
-    "anchors trust better than a polished deck sent cold a few days later."
+JARVIS_WELCOME_ENABLED = _env_bool("JARVIS_WELCOME_ENABLED", True)
+JARVIS_WELCOME_PHRASE = _env_str(
+    "JARVIS_WELCOME_PHRASE", "Welcome home, sir. All systems are online."
 )
 # Seconds after launching SONG_URI before speaking (gives Spotify/browser time to start).
-JARVIS_AFTER_SONG_DELAY_S = 1.0
+JARVIS_AFTER_SONG_DELAY_S = _env_float("JARVIS_AFTER_SONG_DELAY_S", 1.0)
 # Save ElevenLabs PCM as WAV under .cache/jarvis_welcome/; replay skips the API when the key matches.
-JARVIS_WELCOME_CACHE_ENABLED = True
-
-load_dotenv(Path(__file__).resolve().parent / ".env")
+JARVIS_WELCOME_CACHE_ENABLED = _env_bool("JARVIS_WELCOME_CACHE_ENABLED", True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("clap_listen")
+log = logging.getLogger("jarvis")
+
+MAC_MIC_HINT = (
+    "On macOS, allow microphone access: System Settings → Privacy & Security → Microphone → "
+    "turn on your Terminal app, then quit Terminal completely (Cmd+Q) and start Jarvis again."
+)
 
 
 def block_samples() -> int:
@@ -188,9 +240,12 @@ def _choose_input_device(blocksize: int) -> int:
         elif peak < INPUT_SILENT_RMS:
             log.warning(
                 "Configured mic looks silent (probe rms=%.5f). "
-                "Check Windows input level or try another JARVIS_INPUT_DEVICE.",
+                "Check the input level in System Settings → Sound → Input, "
+                "or try another JARVIS_INPUT_DEVICE.",
                 peak,
             )
+            if IS_MAC:
+                log.warning("%s", MAC_MIC_HINT)
         else:
             log.info("Mic probe OK (rms=%.5f).", peak)
         return idx
@@ -234,6 +289,8 @@ def _choose_input_device(blocksize: int) -> int:
         )
         return best_idx
 
+    if IS_MAC:
+        log.warning("Every microphone sounds silent. %s", MAC_MIC_HINT)
     if default is not None and default >= 0:
         log.warning("No active mic found; falling back to default [%d].", default)
         return default
@@ -380,95 +437,124 @@ def say_jarvis_welcome() -> None:
         log.warning("Could not play ElevenLabs audio: %s", e)
 
 
-def play_song(uri: str) -> None:
-    u = uri.strip()
-    if not u:
-        return
+# --- macOS helpers ------------------------------------------------------------
+
+
+def _as_str(s: str) -> str:
+    """Quote a Python string as an AppleScript string literal."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _osascript(
+    script: str, *, javascript: bool = False, timeout: float = 30.0
+) -> tuple[bool, str, str]:
+    """Run AppleScript (or JXA) via osascript. Returns (ok, stdout, stderr)."""
+    if not IS_MAC:
+        return False, "", "not macOS"
+    args = ["osascript"]
+    if javascript:
+        args += ["-l", "JavaScript"]
+    args.append("-")
     try:
-        if sys.platform == "win32":
-            os.startfile(u)
-        else:
-            webbrowser.open(u)
-    except OSError as e:
-        log.warning("Could not open SONG_URI: %s", e)
+        p = subprocess.run(
+            args, input=script, capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, "", str(e)
+    return p.returncode == 0, p.stdout.strip(), p.stderr.strip()
 
 
-def _chrome_executable() -> str | None:
-    if sys.platform == "win32":
-        for base in (
-            os.environ.get("ProgramFiles", r"C:\Program Files"),
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-            os.environ.get("LOCALAPPDATA", ""),
-        ):
-            if not base:
-                continue
-            p = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
-            if os.path.isfile(p):
-                return p
-    return shutil.which("google-chrome") or shutil.which("chrome")
-
-
-def _win32_sorted_monitor_rects() -> list[tuple[int, int, int, int]]:
-    """Each monitor as (left, top, right, bottom), sorted left-to-right then top-to-bottom."""
-    if sys.platform != "win32":
-        return []
-    import ctypes
-    from ctypes import wintypes
-
-    class RECT(ctypes.Structure):
-        _fields_ = [
-            ("left", wintypes.LONG),
-            ("top", wintypes.LONG),
-            ("right", wintypes.LONG),
-            ("bottom", wintypes.LONG),
-        ]
-
-    collected: list[tuple[int, int, int, int]] = []
-
-    @ctypes.WINFUNCTYPE(
-        wintypes.BOOL,
-        wintypes.HMONITOR,
-        wintypes.HDC,
-        ctypes.POINTER(RECT),
-        wintypes.LPARAM,
-    )
-    def _cb(_hm, _hdc, lprc, _lp):
-        r = lprc.contents
-        collected.append((int(r.left), int(r.top), int(r.right), int(r.bottom)))
-        return True
-
-    ctypes.windll.user32.EnumDisplayMonitors(None, None, _cb, 0)
-    collected.sort(key=lambda t: (t[0], t[1]))
-    return collected
-
-
-def _chrome_monitor_top_left(one_based_index: int) -> tuple[int, int]:
-    """Top-left corner on virtual desktop for monitor N (1-based)."""
-    l, t, _, _ = _chrome_monitor_bounds(one_based_index)
-    return (l, t)
-
-
-def _chrome_monitor_bounds(one_based_index: int) -> tuple[int, int, int, int]:
-    """Monitor N as (left, top, right, bottom), 1-based index (sorted like other Chrome helpers)."""
-    rects = _win32_sorted_monitor_rects()
-    if not rects:
-        return (0, 0, 1920, 1080)
-    idx = one_based_index - 1
-    if idx < 0:
-        idx = 0
-    if idx >= len(rects):
+def _log_osascript_failure(what: str, target_app: str, err: str) -> None:
+    e = err.lower()
+    if "-1743" in e or "not authorized to send apple events" in e:
         log.warning(
-            "Monitor %d requested but only %d found; using last monitor.",
+            "%s: macOS blocked automation. Open System Settings → Privacy & Security → "
+            "Automation, find your Terminal app and turn on %s (and System Events).",
+            what,
+            target_app,
+        )
+    elif "-1719" in e or "-25211" in e or "assistive access" in e:
+        log.warning(
+            "%s: macOS needs Accessibility permission. Open System Settings → Privacy & "
+            "Security → Accessibility and turn on your Terminal app, then restart Jarvis. (%s)",
+            what,
+            err,
+        )
+    else:
+        log.warning("%s failed: %s", what, err or "unknown error")
+
+
+def _mac_app_path(name: str) -> Path | None:
+    """Locate Name.app in /Applications, ~/Applications, or via Spotlight."""
+    if not IS_MAC:
+        return None
+    for base in (Path("/Applications"), Path.home() / "Applications"):
+        p = base / f"{name}.app"
+        if p.is_dir():
+            return p
+    try:
+        out = subprocess.run(
+            [
+                "mdfind",
+                f"kMDItemFSName == '{name}.app' && "
+                "kMDItemContentType == 'com.apple.application-bundle'",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.splitlines():
+        if line.strip():
+            return Path(line.strip())
+    return None
+
+
+_SCREENS_JXA = r"""
+ObjC.import('AppKit');
+var screens = $.NSScreen.screens;
+var H = screens.objectAtIndex(0).frame.size.height;
+var out = [];
+for (var i = 0; i < screens.count; i++) {
+  var f = screens.objectAtIndex(i).visibleFrame;
+  out.push([f.origin.x, H - (f.origin.y + f.size.height),
+            f.origin.x + f.size.width, H - f.origin.y]);
+}
+JSON.stringify(out);
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _mac_sorted_screen_rects() -> tuple[tuple[int, int, int, int], ...]:
+    """Usable area of each display as (left, top, right, bottom) in AppleScript window
+    coordinates (origin top-left of the main display), sorted left-to-right then top-to-bottom."""
+    ok, out, err = _osascript(_SCREENS_JXA, javascript=True, timeout=10)
+    if not ok:
+        log.warning("Could not read display layout: %s", err)
+        return ()
+    try:
+        rects = [tuple(int(round(v)) for v in r) for r in json.loads(out)]
+    except (ValueError, TypeError):
+        return ()
+    rects.sort(key=lambda t: (t[0], t[1]))
+    return tuple(rects)  # type: ignore[return-value]
+
+
+def _screen_bounds(one_based_index: int) -> tuple[int, int, int, int] | None:
+    rects = _mac_sorted_screen_rects()
+    if not rects:
+        return None
+    idx = max(0, one_based_index - 1)
+    if idx >= len(rects):
+        log.info(
+            "Display %d requested but only %d connected; using display %d.",
             one_based_index,
+            len(rects),
             len(rects),
         )
         idx = len(rects) - 1
     return rects[idx]
-
-
-def _chrome_monitor_pixel_size(one_based_index: int) -> tuple[int, int]:
-    l, t, r, b = _chrome_monitor_bounds(one_based_index)
-    return (max(320, r - l), max(240, b - t))
 
 
 def _chrome_window_size() -> tuple[int, int]:
@@ -486,430 +572,260 @@ def _chrome_site_user_data_dir(site_key: str) -> str:
     return str(p)
 
 
-def _chrome_new_window_wait_timeout_s() -> float:
-    try:
-        return max(3.0, float((os.environ.get("CHROME_NEW_WINDOW_WAIT_S") or "25").strip()))
-    except ValueError:
-        return 25.0
+def _mac_set_fullscreen(process_name: str, *, wait_s: float = 10.0) -> bool:
+    """Put the front window of an app into native macOS fullscreen (idempotent).
+    Requires Accessibility permission for the app running Jarvis (e.g. Terminal)."""
+    tries = max(1, int(wait_s / 0.25))
+    name = _as_str(process_name)
+    script = f"""
+tell application "System Events"
+  repeat {tries} times
+    if exists process {name} then
+      if (count of windows of process {name}) > 0 then exit repeat
+    end if
+    delay 0.25
+  end repeat
+  tell process {name}
+    set frontmost to true
+    set value of attribute "AXFullScreen" of window 1 to true
+  end tell
+end tell
+"""
+    ok, _, err = _osascript(script, timeout=wait_s + 10)
+    if not ok:
+        _log_osascript_failure(f"Fullscreen for {process_name}", "System Events", err)
+    return ok
 
 
-def _chrome_top_level_browser_hwnds_win32() -> set[int]:
-    """HWND ints for visible-or-minimized top-level Chrome browser windows."""
-    import ctypes
-    from ctypes import wintypes
+# --- Spotify ------------------------------------------------------------------
 
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    GW_OWNER = 4
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080
-    found: set[int] = set()
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def _enum(hwnd: wintypes.HWND, _lp: wintypes.LPARAM) -> bool:
-        if user32.GetWindow(hwnd, GW_OWNER):
-            return True
-        if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
-            return True
-        if not user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
-            return True
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == 0:
-            return True
-        hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-        if not hproc:
-            return True
-        try:
-            buf = ctypes.create_unicode_buffer(4096)
-            sz = wintypes.DWORD(len(buf))
-            if not kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(sz)):
-                return True
-            exe_path = buf.value
-        finally:
-            kernel32.CloseHandle(hproc)
-        if os.path.basename(exe_path).lower() != "chrome.exe":
-            return True
-        r = wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
-            return True
-        w, h = r.right - r.left, r.bottom - r.top
-        if w < 80 or h < 80:
-            return True
-        found.add(int(hwnd))
-        return True
-
-    user32.EnumWindows(_enum, 0)
-    return found
+_SPOTIFY_WEB_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[A-Za-z-]+/)?"
+    r"(track|album|playlist|artist|episode|show)/([A-Za-z0-9]+)"
+)
 
 
-def _wait_new_chrome_hwnd_win32(before: set[int], timeout: float) -> int | None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        time.sleep(0.12)
-        now = _chrome_top_level_browser_hwnds_win32()
-        new = now - before
-        if not new:
-            continue
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        best: int | None = None
-        best_area = 0
-        for h in new:
-            r = wintypes.RECT()
-            if user32.GetWindowRect(h, ctypes.byref(r)):
-                a = max(0, r.right - r.left) * max(0, r.bottom - r.top)
-                if a > best_area:
-                    best_area = a
-                    best = h
-        if best is not None:
-            return best
+def _spotify_uri(u: str) -> str | None:
+    if u.startswith("spotify:"):
+        return u
+    m = _SPOTIFY_WEB_RE.search(u)
+    if m:
+        return f"spotify:{m.group(1)}:{m.group(2)}"
     return None
 
 
-def _chrome_snap_window_to_monitor_win32(
-    hwnd: int,
-    one_based_monitor: int,
-    *,
-    fullscreen: bool,
-    windowed_size: tuple[int, int] | None,
-) -> None:
-    import ctypes
-    from ctypes import wintypes
+def _spotify_web_url(uri: str) -> str:
+    parts = uri.split(":")
+    if len(parts) >= 3:
+        return f"https://open.spotify.com/{parts[1]}/{parts[2]}"
+    return uri
 
-    ml, mt, mr, mb = _chrome_monitor_bounds(one_based_monitor)
-    user32 = ctypes.windll.user32
-    SW_RESTORE = 9
-    SW_SHOWMAXIMIZED = 3
-    HWND_TOP = 0
-    SWP_SHOWWINDOW = 0x0040
-    SWP_FRAMECHANGED = 0x0020
-    flags = SWP_SHOWWINDOW | SWP_FRAMECHANGED
 
-    user32.ShowWindow(hwnd, SW_RESTORE)
-    if fullscreen:
-        w, h = mr - ml, mb - mt
-        x, y = ml, mt
+def _play_in_spotify_app(uri: str) -> None:
+    volume = ""
+    if SPOTIFY_VOLUME.isdigit():
+        volume = f"set sound volume to {max(0, min(100, int(SPOTIFY_VOLUME)))}"
+    # Spotify may still be starting up, so retry until it reports it is playing.
+    script = f"""
+tell application "Spotify"
+  {volume}
+  set ok to false
+  repeat 30 times
+    try
+      play track {_as_str(uri)}
+      delay 0.5
+      if player state is playing then
+        set ok to true
+        exit repeat
+      end if
+    end try
+    delay 0.5
+  end repeat
+  return ok
+end tell
+"""
+    ok, out, err = _osascript(script, timeout=60)
+    if not ok:
+        _log_osascript_failure("Spotify playback", "Spotify", err)
+    elif out != "true":
+        log.warning("Spotify did not start playing %s (is it logged in?).", uri)
     else:
-        ww, wh = windowed_size or _chrome_window_size()
-        w, h = ww, wh
-        x = ml + max(0, (mr - ml - w) // 2)
-        y = mt + max(0, (mb - mt - h) // 2)
-    user32.SetWindowPos(hwnd, HWND_TOP, x, y, w, h, flags)
+        log.info("Spotify is playing %s", uri)
 
-    if fullscreen:
-        user32.ShowWindow(hwnd, SW_SHOWMAXIMIZED)
-        KEYEVENTF_KEYUP = 0x0002
-        VK_F11 = 0x7A
-        fg = user32.GetForegroundWindow()
-        tid_tgt = user32.GetWindowThreadProcessId(hwnd, None)
-        tid_fg = user32.GetWindowThreadProcessId(fg, None) if fg else 0
-        if tid_fg and tid_tgt:
-            user32.AttachThreadInput(tid_fg, tid_tgt, True)
-        user32.SetForegroundWindow(hwnd)
-        if tid_fg and tid_tgt:
-            user32.AttachThreadInput(tid_fg, tid_tgt, False)
-        user32.keybd_event(VK_F11, 0, 0, 0)
-        user32.keybd_event(VK_F11, 0, KEYEVENTF_KEYUP, 0)
+
+def play_song(uri: str) -> None:
+    u = uri.strip()
+    if not u:
+        return
+    spotify = _spotify_uri(u)
+    if IS_MAC and spotify and _mac_app_path("Spotify"):
+        # Runs in the background: a cold Spotify start can take several seconds.
+        threading.Thread(target=_play_in_spotify_app, args=(spotify,), daemon=True).start()
+        return
+    if spotify and not u.startswith("http"):
+        log.info("Spotify app not found; opening the web player instead.")
+        u = _spotify_web_url(spotify)
+    try:
+        if IS_MAC:
+            subprocess.run(["open", u], check=False)
+        else:
+            webbrowser.open(u)
+    except OSError as e:
+        log.warning("Could not open SONG_URI: %s", e)
+
+
+# --- Chrome -------------------------------------------------------------------
 
 
 def _open_url_in_chrome(
-    url: str,
-    *,
-    new_window: bool = True,
-    label: str = "URL",
-    window_position: tuple[int, int] | None = None,
-    window_size: tuple[int, int] | None = None,
-    fullscreen: bool = False,
-    win32_post_fullscreen_monitor: int | None = None,
-    user_data_dir: str | None = None,
+    url: str, *, label: str, monitor: int, fullscreen: bool, site_key: str
 ) -> None:
     u = url.strip()
     if not u:
         return
-    chrome = _chrome_executable()
-    try:
-        if chrome:
-            args = [chrome]
-            if user_data_dir:
-                args.append(f"--user-data-dir={user_data_dir}")
-                args.append("--no-first-run")
-            if new_window:
-                args.append("--new-window")
-            if window_position is not None:
-                x, y = window_position
-                args.append(f"--window-position={x},{y}")
-            if window_size:
-                args.append(f"--window-size={window_size[0]},{window_size[1]}")
-            if fullscreen and not (
-                sys.platform == "win32" and win32_post_fullscreen_monitor is not None
-            ):
-                args.append("--start-fullscreen")
-            args.append(u)
-            popen_kw: dict = {
-                "args": args,
-                "stdin": subprocess.DEVNULL,
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
-            }
-            if sys.platform == "win32":
-                popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-            before: set[int] | None = None
-            if sys.platform == "win32" and win32_post_fullscreen_monitor is not None:
-                before = _chrome_top_level_browser_hwnds_win32()
-            subprocess.Popen(**popen_kw)
-            if sys.platform == "win32" and win32_post_fullscreen_monitor is not None:
-                mon = win32_post_fullscreen_monitor
-                hwnd = _wait_new_chrome_hwnd_win32(before, _chrome_new_window_wait_timeout_s())
-                if hwnd is not None:
-                    _chrome_snap_window_to_monitor_win32(
-                        hwnd,
-                        mon,
-                        fullscreen=fullscreen,
-                        windowed_size=window_size if not fullscreen else None,
-                    )
-                else:
-                    log.warning(
-                        "Chrome: timed out waiting for new window (%s); check "
-                        "CHROME_NEW_WINDOW_WAIT_S or close extra Chrome instances.",
-                        label,
-                    )
+    chrome = _mac_app_path("Google Chrome")
+    if not chrome:
+        log.warning("Google Chrome not found; opening %s in default browser.", label)
+        if IS_MAC:
+            subprocess.run(["open", u], check=False)
         else:
-            log.warning("Chrome not found; opening %s in default browser.", label)
             webbrowser.open(u)
-    except OSError as e:
-        log.warning("Could not open %s in Chrome: %s", label, e)
+        return
+
+    screen = _screen_bounds(monitor)
+    if screen is None:
+        bounds = None
+    elif fullscreen:
+        bounds = screen
+    else:
+        sl, st, sr, sb = screen
+        w, h = _chrome_window_size()
+        w, h = min(w, sr - sl), min(h, sb - st)
+        x = sl + max(0, (sr - sl - w) // 2)
+        y = st + max(0, (sb - st - h) // 2)
+        bounds = (x, y, x + w, y + h)
+
+    if CHROME_SEPARATE_SITE_PROFILES:
+        args = [
+            "open", "-na", str(chrome), "--args",
+            f"--user-data-dir={_chrome_site_user_data_dir(site_key)}",
+            "--no-first-run", "--new-window",
+        ]
+        if bounds:
+            l, t, r, b = bounds
+            args += [f"--window-position={l},{t}", f"--window-size={r - l},{b - t}"]
+        if fullscreen:
+            args.append("--start-fullscreen")
+        args.append(u)
+        try:
+            subprocess.run(args, check=False)
+        except OSError as e:
+            log.warning("Could not open %s in Chrome: %s", label, e)
+        return
+
+    set_bounds = ""
+    if bounds:
+        set_bounds = "set bounds of w to {%d, %d, %d, %d}" % bounds
+    script = f"""
+tell application "Google Chrome"
+  activate
+  set w to make new window
+  set URL of active tab of w to {_as_str(u)}
+  {set_bounds}
+  set index of w to 1
+end tell
+"""
+    ok, _, err = _osascript(script)
+    if not ok:
+        _log_osascript_failure(f"Opening {label} in Chrome", "Google Chrome", err)
+        subprocess.run(["open", "-a", str(chrome), u], check=False)
+        return
+    if fullscreen:
+        time.sleep(0.6)
+        _mac_set_fullscreen("Google Chrome", wait_s=3.0)
+        # Let the fullscreen animation finish before the next window is created.
+        time.sleep(1.2)
 
 
 def open_claude_in_chrome() -> None:
     if not OPEN_CLAUDE_CODE_IN_CHROME:
         return
-    url = (os.environ.get("CLAUDE_CODE_URL") or "https://claude.ai/new").strip()
-    pos: tuple[int, int] | None = None
-    size: tuple[int, int] | None = None
-    fs = OPEN_CHROME_FULLSCREEN
-    post_mon: int | None = None
-    user_data: str | None = None
-    if sys.platform == "win32":
-        post_mon = CLAUDE_CHROME_MONITOR
-        pos = _chrome_monitor_top_left(CLAUDE_CHROME_MONITOR)
-        if fs:
-            size = _chrome_monitor_pixel_size(CLAUDE_CHROME_MONITOR)
-        else:
-            size = _chrome_window_size()
-        if CHROME_SEPARATE_SITE_PROFILES:
-            user_data = _chrome_site_user_data_dir("claude")
-    elif not fs:
-        size = _chrome_window_size()
-    else:
-        size = None
     _open_url_in_chrome(
-        url,
-        new_window=True,
+        CLAUDE_CODE_URL,
         label="Claude",
-        window_position=pos,
-        window_size=size,
-        fullscreen=fs,
-        win32_post_fullscreen_monitor=post_mon,
-        user_data_dir=user_data,
+        monitor=CLAUDE_CHROME_MONITOR,
+        fullscreen=OPEN_CHROME_FULLSCREEN,
+        site_key="claude",
     )
 
 
-def open_binance_btc_in_chrome() -> None:
-    if not OPEN_BINANCE_BTC_IN_CHROME:
+def open_tasaradar_in_chrome() -> None:
+    if not OPEN_TASARADAR_IN_CHROME:
         return
-    url = (
-        os.environ.get("BINANCE_BTC_URL")
-        or "https://www.binance.com/en/trade/BTC_USDT"
-    ).strip()
-    pos: tuple[int, int] | None = None
-    size: tuple[int, int] | None = None
-    fs = OPEN_CHROME_FULLSCREEN
-    post_mon: int | None = None
-    user_data: str | None = None
-    if sys.platform == "win32":
-        post_mon = BINANCE_CHROME_MONITOR
-        pos = _chrome_monitor_top_left(BINANCE_CHROME_MONITOR)
-        if fs:
-            size = _chrome_monitor_pixel_size(BINANCE_CHROME_MONITOR)
-        else:
-            size = _chrome_window_size()
-        if CHROME_SEPARATE_SITE_PROFILES:
-            user_data = _chrome_site_user_data_dir("binance")
-    elif not fs:
-        size = _chrome_window_size()
-    else:
-        size = None
     _open_url_in_chrome(
-        url,
-        new_window=True,
-        label="Binance BTC",
-        window_position=pos,
-        window_size=size,
-        fullscreen=fs,
-        win32_post_fullscreen_monitor=post_mon,
-        user_data_dir=user_data,
+        TASARADAR_URL,
+        label="Tasaradar",
+        monitor=TASARADAR_CHROME_MONITOR,
+        fullscreen=OPEN_CHROME_FULLSCREEN,
+        site_key="tasaradar",
     )
 
 
-def _cursor_executable() -> str | None:
-    if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA", "")
-        for sub in ("Programs\\cursor\\Cursor.exe", "Programs\\Cursor\\Cursor.exe"):
-            if local:
-                p = os.path.join(local, *sub.split("\\"))
-                if os.path.isfile(p):
-                    return p
+# --- Cursor -------------------------------------------------------------------
+
+
+def _cursor_cli(app: Path | None) -> str | None:
+    if app:
+        p = app / "Contents" / "Resources" / "app" / "bin" / "cursor"
+        if p.is_file():
+            return str(p)
     return shutil.which("cursor")
 
 
-def _cursor_largest_main_hwnd_win32() -> int | None:
-    """Largest top-level Cursor.exe window (visible or minimized)."""
-    if sys.platform != "win32":
-        return None
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    GW_OWNER = 4
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080
-    candidates: list[tuple[int, wintypes.HWND]] = []
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def _enum(hwnd: wintypes.HWND, _lp: wintypes.LPARAM) -> bool:
-        if user32.GetWindow(hwnd, GW_OWNER):
-            return True
-        if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
-            return True
-        if not user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
-            return True
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == 0:
-            return True
-        hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-        if not hproc:
-            return True
-        try:
-            buf = ctypes.create_unicode_buffer(4096)
-            sz = wintypes.DWORD(len(buf))
-            if not kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(sz)):
-                return True
-            exe_path = buf.value
-        finally:
-            kernel32.CloseHandle(hproc)
-        if os.path.basename(exe_path).lower() != "cursor.exe":
-            return True
-        r = wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
-            return True
-        w, h = r.right - r.left, r.bottom - r.top
-        if w < 200 or h < 200:
-            return True
-        candidates.append((w * h, hwnd))
-        return True
-
-    user32.EnumWindows(_enum, 0)
-    if not candidates:
-        return None
-    return int(max(candidates, key=lambda t: t[0])[1])
-
-
-def _cursor_foreground_hwnd_win32(hwnd: int) -> None:
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.windll.user32
-    SW_RESTORE = 9
-    user32.ShowWindow(hwnd, SW_RESTORE)
-    fg = user32.GetForegroundWindow()
-    tid_tgt = user32.GetWindowThreadProcessId(hwnd, None)
-    tid_fg = user32.GetWindowThreadProcessId(fg, None) if fg else 0
-    if tid_fg and tid_tgt:
-        user32.AttachThreadInput(tid_fg, tid_tgt, True)
-    user32.SetForegroundWindow(hwnd)
-    if tid_fg and tid_tgt:
-        user32.AttachThreadInput(tid_fg, tid_tgt, False)
-
-
-def _cursor_send_f11_fullscreen_win32(hwnd: int) -> None:
-    """F11 toggles Zen/fullscreen in Cursor (Electron)."""
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.windll.user32
-    KEYEVENTF_KEYUP = 0x0002
-    VK_F11 = 0x7A
-    _cursor_foreground_hwnd_win32(hwnd)
-    user32.keybd_event(VK_F11, 0, 0, 0)
-    user32.keybd_event(VK_F11, 0, KEYEVENTF_KEYUP, 0)
-
-
-def _focus_existing_cursor_window_win32() -> bool:
-    """Bring an existing Cursor.exe main window to the foreground (no new process)."""
-    if sys.platform != "win32":
-        return False
-    hwnd = _cursor_largest_main_hwnd_win32()
-    if hwnd is None:
-        return False
-    _cursor_foreground_hwnd_win32(hwnd)
-    return True
+def open_cursor_window() -> None:
+    if not FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP and not OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
+        return
+    app = _mac_app_path("Cursor")
+    cli = _cursor_cli(app)
+    if not app and not cli:
+        log.warning("Could not find Cursor (install it from https://cursor.com).")
+        return
+    quiet: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    try:
+        if FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP:
+            if app:
+                # Brings the running Cursor (all its windows) to the front, or launches it.
+                subprocess.run(["open", "-a", str(app)], check=False, **quiet)
+            else:
+                subprocess.Popen([cli], **quiet)
+        if OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
+            if cli:
+                subprocess.Popen([cli, "-n"], **quiet)
+            else:
+                subprocess.run(["open", "-n", "-a", str(app)], check=False, **quiet)
+    except OSError as e:
+        log.warning("Could not start or focus Cursor: %s", e)
+        return
+    if IS_MAC and CURSOR_OPEN_FULLSCREEN:
+        time.sleep(0.5)
+        _mac_set_fullscreen("Cursor", wait_s=15.0)
 
 
 def run_double_clap_actions() -> None:
     """Run outside the mic loop so sleeps do not stall capture."""
     play_song(SONG_URI)
     open_claude_in_chrome()
-    open_binance_btc_in_chrome()
+    open_tasaradar_in_chrome()
     if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
         delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
         if delay:
             time.sleep(delay)
         threading.Thread(target=say_jarvis_welcome, daemon=True).start()
     open_cursor_window()
-
-
-def open_cursor_window() -> None:
-    if not FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP and not OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
-        return
-    exe = _cursor_executable()
-    if not exe:
-        log.warning(
-            "Could not find Cursor (install app or add the `cursor` command to PATH)."
-        )
-        return
-    popen_kw: dict = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if sys.platform == "win32":
-        popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-    try:
-        if FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP:
-            focused = (
-                sys.platform == "win32" and _focus_existing_cursor_window_win32()
-            )
-            if not focused:
-                subprocess.Popen([exe], **popen_kw)
-        if OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
-            subprocess.Popen([exe, "-n"], **popen_kw)
-    except OSError as e:
-        log.warning("Could not start or focus Cursor: %s", e)
-        return
-    if sys.platform == "win32" and CURSOR_OPEN_FULLSCREEN:
-        time.sleep(0.5)
-        hwnd = _cursor_largest_main_hwnd_win32()
-        if hwnd is not None:
-            _cursor_send_f11_fullscreen_win32(hwnd)
-        else:
-            log.warning("Cursor fullscreen: no Cursor window found to send F11.")
 
 
 def main() -> int:
@@ -920,6 +836,12 @@ def main() -> int:
     spike_armed = True
     welcome_sequence_done = False
 
+    if not IS_MAC:
+        log.warning(
+            "This version of Jarvis targets macOS; app control (Spotify, Chrome, Cursor "
+            "focus/fullscreen) is limited on %s.",
+            sys.platform,
+        )
     log.info(
         "Listening (double clap: %.2f–%.2fs apart, rate=%d, block=%d ms, "
         "spike_ratio=%.1f, cooldown=%.2fs). Ctrl+C to stop.",
@@ -931,37 +853,30 @@ def main() -> int:
         COOLDOWN_S,
     )
     if SONG_URI.strip():
-        log.info("Double clap opens this track: %s", SONG_URI.strip())
+        log.info("Double clap plays this track: %s", SONG_URI.strip())
     else:
-        log.info("SONG_URI is empty — set it to play one song on each double clap.")
-    if FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP:
-        log.info(
-            "Double clap will foreground an existing Cursor window (Windows API); "
-            "falls back to launching Cursor if none is running."
-        )
-    if OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
-        log.info("Double clap will also open a new Cursor window (-n).")
-    if CURSOR_OPEN_FULLSCREEN and sys.platform == "win32":
-        log.info("Cursor will be sent F11 for fullscreen after focus/launch.")
+        log.info("JARVIS_SONG_URI is empty — set it to play one song on each double clap.")
     if OPEN_CLAUDE_CODE_IN_CHROME:
-        cu = (os.environ.get("CLAUDE_CODE_URL") or "https://claude.ai/new").strip()
         log.info(
-            "After Spotify, open Claude in Chrome%s on monitor %d: %s",
+            "Then open Claude in Chrome%s on display %d: %s",
             " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
             CLAUDE_CHROME_MONITOR,
-            cu,
+            CLAUDE_CODE_URL,
         )
-    if OPEN_BINANCE_BTC_IN_CHROME:
-        bu = (
-            os.environ.get("BINANCE_BTC_URL")
-            or "https://www.binance.com/en/trade/BTC_USDT"
-        ).strip()
+    if OPEN_TASARADAR_IN_CHROME:
         log.info(
-            "After Spotify, open Binance BTC in Chrome%s on monitor %d: %s",
+            "Then open Tasaradar in Chrome%s on display %d: %s",
             " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
-            BINANCE_CHROME_MONITOR,
-            bu,
+            TASARADAR_CHROME_MONITOR,
+            TASARADAR_URL,
         )
+    if FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP:
+        log.info(
+            "Then bring Cursor to the front (launching it if needed)%s.",
+            " in fullscreen" if CURSOR_OPEN_FULLSCREEN else "",
+        )
+    if OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
+        log.info("Double clap will also open a new Cursor window.")
     if JARVIS_WELCOME_ENABLED:
         ev, em, ef, er = elevenlabs_env_config()
         log.info(
@@ -975,6 +890,7 @@ def main() -> int:
         )
 
     input_idx = _choose_input_device(blocksize)
+    log.info("Ready — clap twice.")
 
     try:
         with sd.InputStream(
@@ -1041,7 +957,9 @@ def main() -> int:
         return 0
     except sd.PortAudioError as e:
         log.error("Audio error: %s", e)
-        log.error("If PortAudio fails, install/repair drivers or try another SAMPLE_RATE.")
+        log.error("Try another JARVIS_SAMPLE_RATE (e.g. 48000) or JARVIS_INPUT_DEVICE.")
+        if IS_MAC:
+            log.error("%s", MAC_MIC_HINT)
         return 1
 
     return 0
