@@ -18,6 +18,7 @@ Protocol (one JSON object per line):
         Jarvis is the active (frontmost) app — jarvis.py waits for this before Spotify.
     {"event": "focused", "ack": 3, "active": true, "frontmost": "Python"}
     {"event": "refocused", "from": "Spotify"}   the guard took focus back from an app
+    {"event": "activate"}   Space bar or the mic button: start a conversation
 
 The window stays open until the user closes it (Esc twice, the power button, or Cmd+Q);
 it also closes if jarvis.py exits (stdin is closed).
@@ -102,6 +103,10 @@ def main() -> int:
         def quit(self) -> None:
             if window is not None:
                 window.destroy()
+
+        def activate(self) -> None:
+            """Space bar / mic button: ask jarvis.py to start listening."""
+            emit(event="activate")
 
     window = webview.create_window(
         "JARVIS",

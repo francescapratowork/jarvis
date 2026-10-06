@@ -392,8 +392,16 @@
   }
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { const t = now(); if (t - lastEsc < 1.0) quit(); lastEsc = t; }
+    if (e.code === "Space" && !e.repeat) { e.preventDefault(); activate(); }
   });
   $("exitBtn").addEventListener("click", quit);
+
+  // Space bar / mic button: start talking to Jarvis
+  function activate() {
+    try { if (window.pywebview && window.pywebview.api && window.pywebview.api.activate) window.pywebview.api.activate(); } catch (e) {}
+  }
+  $("pill").style.cursor = "pointer";
+  $("pill").addEventListener("click", activate);
 
   // ------------------------------------------------------------------ static DOM bits
   const spec = $("spectrum"); const specBars = [];
@@ -440,6 +448,7 @@
     if (t - S.lastLevelAt > 0.25) S.levelTarget = S.state === "SPEAKING" ? 0.35 + 0.3 * noise(3, t * 1.7) : 0;
     S.level = lerp(S.level, S.levelTarget, 1 - Math.exp(-dt * 14));
     const L = S.level * S.p.speak;
+    const LL = S.level * S.p.listen; // her voice while LISTENING
     rot += dt * S.p.spin;
 
     // spotify volume animation
@@ -533,7 +542,7 @@
     if (S.p.listen > 0.01) {
       for (let i = 0; i < 3; i++) {
         const k = ((t * 0.6 + i / 3) % 1);
-        ring(R * (0.34 + k * 0.4), (1 - k) * 0.45 * S.p.listen, 1.5);
+        ring(R * (0.34 + k * (0.4 + 0.25 * LL)), (1 - k) * (0.45 + 0.5 * LL) * S.p.listen, 1.5 + 2 * LL);
       }
     }
 
@@ -563,7 +572,7 @@
 
     // inner core
     const breathe = 0.5 + 0.5 * Math.sin(t * (S.state === "LISTENING" ? 3 : 1.6));
-    const rc = R * (0.3 + 0.012 * breathe + 0.05 * L);
+    const rc = R * (0.3 + 0.012 * breathe + 0.05 * L + 0.035 * LL);
     const ig = cx.createRadialGradient(0, 0, 0, 0, 0, rc);
     ig.addColorStop(0, `rgba(${CY},${0.10 + 0.25 * L})`); ig.addColorStop(0.8, `rgba(${CY},${0.04 + 0.06 * g})`); ig.addColorStop(1, `rgba(${CY},0.0)`);
     cx.fillStyle = ig; cx.beginPath(); cx.arc(0, 0, rc, 0, Math.PI * 2); cx.fill();
@@ -591,7 +600,7 @@
       const mid = 1 - Math.abs(i - 15) / 16;
       let v = active ? 0.08 + 0.12 * noise(i, t * 0.8) * mid : 0.05;
       if (S.p.speak > 0.05) v += L * (0.35 + 0.65 * noise(i + 40, t * 3)) * mid * 1.4;
-      if (S.p.listen > 0.05) v += 0.25 * S.p.listen * noise(i + 9, t * 2) * mid;
+      if (S.p.listen > 0.05) v += (0.25 + 1.2 * LL) * S.p.listen * noise(i + 9, t * 2.5) * mid;
       if (S.p.think > 0.05) v += 0.2 * S.p.think * (0.5 + 0.5 * Math.sin(t * 6 - i * 0.5)) * mid;
       waveBars[i].style.height = (4 + clamp(v, 0, 1) * 36) + "px";
       waveBars[i].style.opacity = 0.35 + clamp(v, 0, 1) * 0.65;

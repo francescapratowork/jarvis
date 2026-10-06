@@ -6,7 +6,7 @@ A Python script that listens to your Mac's microphone. When you **clap twice**, 
 2. starts your song in the **Spotify** app in the background — Spotify's window never appears — at full volume,
 3. after the song has played for 7 s (while the interface boots), smoothly **ducks** the music to 35% — still audible — and speaks a welcome line in your **ElevenLabs** voice over it, while the interface shows **SPEAKING** and reacts to the voice,
 4. when the voice finishes, **fades the music back up** over ~2 s (Spotify's own volume only — your Mac's volume and other sounds are untouched),
-5. shows **AWAITING COMMAND** and stays open until you close it.
+5. shows **AWAITING COMMAND**, then starts **listening** — you can talk to Jarvis naturally, in Italian or English (see *Talking to Jarvis*). The interface stays open until you close it.
 
 Jarvis no longer opens any other apps or websites (Claude, Chrome, Cursor, Tasaradar) by itself.
 
@@ -165,6 +165,41 @@ Level: room noise 0.0512 | loudest 0.4730 | clap threshold 0.252
 - **Level** (every 5 seconds): room noise, the loudest recent sound, and how loud a clap must be.
 - Jarvis only accepts two claps with silence around them, so typing, talking or music between or right after the claps cancels them.
 
+## Talking to Jarvis (Phase 2A)
+
+After the welcome, Jarvis listens. Just speak — no commands to memorise:
+
+- "Jarvis, cosa ho domani?" · "Quando sono libera giovedì?" · "Che promemoria ho per oggi?"
+- "Ricordati che devo ricontattare Giulia venerdì." → *"Annotato."* (saved in Jarvis's memory)
+- "Aprimi Claude." · "Grazie, basta così." (ends the conversation)
+
+The interface shows what is really happening: **LISTENING** (the core reacts to your voice) → **THINKING** → **SPEAKING** → **LISTENING**. Your words and Jarvis's actions appear in the event log. After about **60 seconds of silence** Jarvis goes back to **AWAITING COMMAND** — press **Space** (or click the microphone button) to talk again. While you talk with Jarvis, Spotify plays more quietly (`JARVIS_CONVERSATION_MUSIC_VOLUME`).
+
+**What it can do in this version:** read your calendars and reminders (everything visible on this Mac), find free time, remember and recall important facts (stored only on your Mac in `data/`, never in the repository), forget a fact (only after you confirm), open apps when you ask. Creating or changing calendar events and reminders comes in the next phase — it will always ask for your confirmation first.
+
+**What it needs (one-time setup):**
+1. Calendar access — run `./start_jarvis.sh --check-calendar` and follow what it says.
+2. An Anthropic API key in `.env` as `ANTHROPIC_API_KEY=…` (console.anthropic.com).
+3. Your ElevenLabs key must allow **Speech to Text** (ElevenLabs → Developers → API Keys → edit the key → Speech to Text: Access).
+
+Until the Anthropic key is added, Jarvis behaves exactly as before and stays on AWAITING COMMAND.
+
+**Test the brain by typing** (no microphone or voice): `./start_jarvis.sh --chat`
+
+**Privacy:** what you say is transcribed by ElevenLabs and answered by Anthropic's Claude (including any calendar details needed for the answer). Memory and calendar access stay on your Mac. Keys are never printed or logged.
+
+| Setting | What it does | Default |
+| ------- | ------------ | ------- |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (keep it secret). | *(empty — conversation off)* |
+| `JARVIS_LLM_MODEL` / `JARVIS_LLM_EFFORT` | Claude model and how hard it thinks (`low` = fastest). | `claude-opus-5-5` / `low` |
+| `JARVIS_STT_MODEL` | ElevenLabs speech-to-text model. | `scribe_v2_realtime` |
+| `JARVIS_REPLY_TTS_MODEL` | ElevenLabs voice model for replies (same Bella voice ID; the welcome keeps `ELEVENLABS_MODEL_ID`). `eleven_flash_v2_5` is the fastest; `eleven_multilingual_v2` matches the welcome exactly. | `eleven_flash_v2_5` |
+| `JARVIS_CONVERSATION_TIMEOUT_S` | Seconds of silence before returning to AWAITING COMMAND. | `60` |
+| `JARVIS_CONVERSATION_MUSIC_VOLUME` | Spotify volume during a conversation (`off` = unchanged). | `25` |
+| `JARVIS_USER_NAME` | How Jarvis addresses you. | `Miss Prato` |
+| `JARVIS_CONVERSATION_ENABLED` / `JARVIS_CONVERSATION_AUTOSTART` | Turn conversation off / don't start listening right after the welcome. | `true` / `true` |
+| `JARVIS_CALENDAR_BACKEND` | `auto`, `eventkit` (direct) or `applescript` (via the Calendar app). | `auto` |
+
 ## macOS permissions (first run)
 
 macOS asks for permission the first time Jarvis does each thing. Click **Allow** / **OK** each time:
@@ -173,6 +208,7 @@ macOS asks for permission the first time Jarvis does each thing. Click **Allow**
 | ------ | --- |
 | "Terminal" would like to access the microphone | Hearing your claps. |
 | "Terminal" wants access to control "Spotify" | Playing the song and controlling its volume in the background. |
+| "Terminal" would like to access your calendars / reminders (or to control "Calendar" / "Reminders") | Reading your schedule and reminders (`--check-calendar`). |
 
 The full-screen interface needs no extra permission. If you click "Don't Allow" by mistake, turn it back on in **System Settings → Privacy & Security** under **Microphone** or **Automation**, then quit Terminal (Cmd+Q) and start again.
 

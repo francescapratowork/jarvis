@@ -74,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.12 (interface ready handshake before Spotify, focus guard)"
+JARVIS_VERSION = "2026-10-06.13 (Phase 2A: voice conversation, memory, calendar read)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -462,6 +462,12 @@ class JarvisUI:
         self._ack_cond = threading.Condition()
         self._next_ack = 0
         self._t_launch = 0.0
+        self._subscribers: dict[str, list] = {}
+
+    def on_event(self, kind: str, callback) -> None:
+        """Call `callback(event)` for every event of this kind from the interface
+        (e.g. "activate" when Space or the mic button is pressed)."""
+        self._subscribers.setdefault(kind, []).append(callback)
 
     def start(self) -> bool:
         if not JARVIS_UI_ENABLED:
@@ -508,6 +514,11 @@ class JarvisUI:
                     "Jarvis interface: %s took focus — brought Jarvis back to the front.",
                     ev.get("from") or "another app",
                 )
+            for callback in self._subscribers.get(kind or "", []):
+                try:
+                    callback(ev)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Jarvis interface: event handler failed (%s).", e)
         # Child exited: wake anyone still waiting for it.
         self._ready.set()
         with self._ack_cond:
@@ -1424,11 +1435,48 @@ def run_double_clap_actions() -> None:
             "Jarvis interface is open and awaiting commands. Close it with Esc twice, the "
             "power button or Cmd+Q (or press Ctrl+C here)."
         )
+        conversation = _start_conversation(music)
         try:
             UI.wait_closed()
         finally:
+            if conversation is not None:
+                conversation.stop()
             UI.close()
         log.info("Jarvis interface closed.")
+
+
+class ConversationMusic:
+    """Keeps Spotify quieter while a voice conversation is active (Spotify's own volume)."""
+
+    def __init__(self, music: "SpotifyPlayback", volume: int) -> None:
+        self.music = music
+        self.volume = min(volume, music.full_volume)
+        self.ducked = False
+
+    def duck(self) -> None:
+        if self.volume < self.music.full_volume and not self.ducked:
+            self.ducked = True
+            _spotify_fade(self.music.full_volume, self.volume, 0.5)
+
+    def restore(self) -> None:
+        if self.ducked:
+            self.ducked = False
+            _spotify_fade(self.volume, self.music.full_volume, 1.5)
+
+
+def _start_conversation(music: "SpotifyPlayback | None"):
+    """Phase 2A: voice conversation after AWAITING COMMAND (see assistant/). Never raises."""
+    try:
+        from assistant.config import load_config
+        from assistant.runtime import start_conversation
+    except Exception as e:  # noqa: BLE001 — missing package etc.: Jarvis keeps working without it
+        log.warning("Conversation: unavailable (%s). Run ./start_jarvis.sh to install packages.", e)
+        return None
+    cfg = load_config()
+    music_ctl = None
+    if music is not None and cfg.music_volume is not None:
+        music_ctl = ConversationMusic(music, cfg.music_volume)
+    return start_conversation(UI, music_ctl)
 
 
 def run_ui_demo() -> int:
@@ -1659,6 +1707,14 @@ def main() -> int:
     if "--ui-demo" in sys.argv[1:]:
         log.info("Jarvis version %s — interface demo", JARVIS_VERSION)
         return run_ui_demo()
+    if "--check-calendar" in sys.argv[1:]:
+        from assistant.runtime import run_check_calendar
+
+        return run_check_calendar()
+    if "--chat" in sys.argv[1:]:
+        from assistant.runtime import run_text_chat
+
+        return run_text_chat()
     test_mode = "--test" in sys.argv[1:] or _env_bool("JARVIS_TEST_MODE", False)
     log.info("Jarvis version %s — running %s", JARVIS_VERSION, Path(__file__).resolve())
     log.info("Settings file: %s (%s)", ENV_PATH, "found" if ENV_PATH.is_file() else "NOT FOUND")
