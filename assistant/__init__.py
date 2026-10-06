@@ -9,7 +9,9 @@ AWAITING COMMAND) and turns Jarvis into a voice assistant:
 
 Modules:
   config        settings from .env (keys are never printed or logged)
-  memory        local long-term memory (SQLite, data/jarvis_memory.db)
+  memory        local long-term memory v2 (SQLite, data/jarvis_memory.db): kinds, status,
+                replacement (superseding) and the per-turn working set
+  onboarding    one-time, repeatable profile import (dry run → --apply)
   calendar      macOS Calendar/Reminders access (via calendar_helper subprocess)
   tools         tool registry: every capability is one tool, read or write
   brain         Claude conversation loop, confirmations, sentence streaming

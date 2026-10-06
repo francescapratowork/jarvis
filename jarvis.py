@@ -74,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.15 (Spotify: exactly one play command per startup)"
+JARVIS_VERSION = "2026-10-06.16 (Phase 2B M1: memory v2, onboarding, working set)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -1782,6 +1782,15 @@ def main() -> int:
         from assistant.runtime import run_check_calendar
 
         return run_check_calendar()
+    if "--import-profile" in sys.argv[1:]:
+        from assistant.runtime import run_import_profile
+
+        args = sys.argv[sys.argv.index("--import-profile") + 1:]
+        return run_import_profile(args)
+    if "--show-memory" in sys.argv[1:]:
+        from assistant.runtime import run_show_memory
+
+        return run_show_memory(sys.argv[1:])
     if "--chat" in sys.argv[1:]:
         from assistant.runtime import run_text_chat
 

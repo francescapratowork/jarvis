@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .calendar import CalendarError, CalendarService
-from .memory import KINDS, MemoryStore
+from .memory import DOMAINS, KINDS, MemoryStore
 
 
 @dataclass
@@ -31,6 +31,10 @@ class Tool:
     handler: Callable[..., Any]
     mutates: bool = False
     summarize: Callable[..., str] | None = None  # how a write action is read back
+    # For tools that only *sometimes* need confirmation (e.g. memory: replacing an active
+    # goal does, saving an ordinary fact doesn't): returns the reason, or "" to run now.
+    # The handler then receives confirmed=True when it runs after the user's yes.
+    confirm_check: Callable[..., str] | None = None
 
     def definition(self) -> dict:
         return {"name": self.name, "description": self.description, "input_schema": self.schema}
@@ -43,6 +47,7 @@ class PendingAction:
     args: dict
     summary: str
     created_turn: int
+    confirmed_arg: bool = False  # pass confirmed=True to the handler
 
 
 @dataclass
@@ -79,10 +84,21 @@ class ToolRegistry:
             return {"error": f"unknown tool {name}"}
         if not isinstance(args, dict):
             return {"error": "invalid arguments"}
-        if tool.mutates:
+        # Only the registry may say an action was confirmed (never the model's arguments).
+        args = {k: v for k, v in args.items() if k != "confirmed"}
+        reason = ""
+        if not tool.mutates and tool.confirm_check is not None:
+            try:
+                reason = tool.confirm_check(ctx=ctx, **args)
+            except (TypeError, ValueError):
+                reason = ""  # the handler will report the problem
+        if tool.mutates or reason:
             self._next_id += 1
-            summary = tool.summarize(**args) if tool.summarize else f"{name} {json.dumps(args, ensure_ascii=False)}"
-            self.pending = PendingAction(f"A{self._next_id}", name, args, summary, turn)
+            if reason:
+                summary = reason
+            else:
+                summary = tool.summarize(**args) if tool.summarize else f"{name} {json.dumps(args, ensure_ascii=False)}"
+            self.pending = PendingAction(f"A{self._next_id}", name, args, summary, turn, confirmed_arg=bool(reason))
             ctx.log(f"Confirm? {summary}")
             return {
                 "status": "needs_confirmation",
@@ -95,15 +111,22 @@ class ToolRegistry:
         return tool.handler(ctx=ctx, **args)
 
     # The two built-in tools that resolve a pending write action.
-    def confirm(self, action_id: str, ctx: ToolContext, turn: int) -> dict:
+    def confirm(self, action_id: str, ctx: ToolContext, turn: int, user_text: str | None = None) -> dict:
         p = self.pending
         if p is None or p.action_id != action_id:
             return {"error": "there is no pending action with that id; propose the action again"}
         if turn != p.created_turn + 1:
             self.pending = None
             return {"error": "confirmation must come in the user's very next reply; propose it again"}
+        if user_text is not None and not is_clear_yes(user_text):
+            # Not done. Her reply was not an unambiguous yes: keep it pending one more turn.
+            p.created_turn = turn
+            return {"error": "not confirmed: the user's reply is not a clear yes, so nothing was done. "
+                    "Ask her to answer yes or no."}
         self.pending = None
         ctx.log(f"Confirmed: {p.summary}")
+        if p.confirmed_arg:
+            return self.tools[p.tool].handler(ctx=ctx, confirmed=True, **p.args)
         return self.tools[p.tool].handler(ctx=ctx, **p.args)
 
     def cancel(self, ctx: ToolContext) -> dict:
@@ -111,6 +134,30 @@ class ToolRegistry:
             ctx.log(f"Cancelled: {self.pending.summary}")
         self.pending = None
         return {"status": "cancelled"}
+
+
+# ---------------------------------------------------------------------- confirmation words
+_YES_WORDS = {
+    "si", "sì", "yes", "yeah", "yep", "ok", "okay", "confermo", "conferma", "confermato", "certo",
+    "certamente", "esatto", "procedi", "vai", "fallo", "sure", "confirm", "confirmed", "correct",
+    "giusto", "perfetto", "assolutamente", "daccordo", "absolutely",
+}
+_YES_PHRASES = ("va bene", "d'accordo", "d accordo", "go ahead", "do it", "of course", "sounds good")
+_NO_WORDS = {
+    "no", "non", "not", "nope", "don't", "dont", "annulla", "cancella", "cancel", "aspetta", "wait",
+    "stop", "never", "mai", "niente", "nothing",
+}
+
+
+def is_clear_yes(text: str) -> bool:
+    """True only for an unambiguous yes ("sì", "confermo", "yes, go ahead"). Anything with a
+    negation or hesitation ("sì, ma non adesso", "wait") is not a yes. Enforced in code so a
+    misheard or misread reply can never trigger an action."""
+    t = (text or "").lower().replace("’", "'")
+    words = "".join(c if (c.isalnum() or c == "'") else " " for c in t).split()
+    if not words or any(w in _NO_WORDS for w in words):
+        return False
+    return any(w in _YES_WORDS for w in words) or any(p in t for p in _YES_PHRASES)
 
 
 # ---------------------------------------------------------------------- helpers
@@ -177,19 +224,65 @@ def _reminders_list(ctx: ToolContext, due_before: str | None = None) -> dict:
     return {"reminders": items[:60], "total": len(items)}
 
 
-def _memory_remember(ctx: ToolContext, kind: str, content: str, subject: str = "", importance: int = 3) -> dict:
+def _memory_args(kind: str, content: str, subject: str = "", importance: int = 3, domain: str = "general",
+                 status: str = "active", slot_key: str = "", data=None, replaces_id: int | None = None,
+                 additional: bool = False) -> dict:
+    return dict(kind=kind, content=content, subject=subject, importance=importance, domain=domain,
+                status=status, slot_key=slot_key, data=data, replaces_id=replaces_id, additional=additional)
+
+
+def _memory_remember_check(ctx: ToolContext, **args) -> str:
+    plan = ctx.memory.plan_remember(**_memory_args(**args))
+    return plan.get("needs_confirmation") or ""
+
+
+def _memory_remember(ctx: ToolContext, confirmed: bool = False, **args) -> dict:
     try:
-        result = ctx.memory.remember(kind, content, subject, importance)
+        result = ctx.memory.remember(**_memory_args(**args), confirmed=confirmed)
     except ValueError as e:
-        return {"error": str(e)}
-    ctx.log(f"Memory {result['status']}: {content[:60]}")
+        return {"status": "not_saved", "reason": str(e)}
+    if result["status"] == "possible_conflict":
+        return {
+            **result,
+            "instruction": "Nothing saved yet. These active memories look related. If the new one REPLACES "
+            "one of them, call memory_remember again with replaces_id (she will be asked to confirm a "
+            "goal/decision change). If it is genuinely an ADDITIONAL one, call again with additional=true. "
+            "If unsure, ask her.",
+        }
+    content = args.get("content", "")
+    if result.get("superseded"):
+        ctx.log(f"Memory updated (#{result['superseded']} kept as history): {content[:50]}")
+    elif result["status"] != "unchanged":
+        ctx.log(f"Memory {result['status']}: {content[:60]}")
     return result
 
 
-def _memory_recall(ctx: ToolContext, query: str = "", kind: str = "", limit: int = 8) -> dict:
-    items = ctx.memory.recall(query, kind if kind in KINDS else "", limit)
-    ctx.log(f"Memory: {len(items)} found" + (f" for '{query[:30]}'" if query else ""))
-    return {"memories": items}
+def _memory_recall(ctx: ToolContext, query: str = "", kind: str = "", limit: int = 8,
+                   domain: str = "", include_history: bool = False) -> dict:
+    items = ctx.memory.recall(query, kind if kind in KINDS else "", limit,
+                              include_history=bool(include_history),
+                              domain=domain if domain in DOMAINS else "")
+    ctx.log(f"Memory: {len(items)} found" + (f" for '{query[:30]}'" if query else "")
+            + (" (incl. history)" if include_history else ""))
+    result = {"memories": items}
+    if include_history:
+        result["note"] = ("Items with status superseded/archived/completed are HISTORY: they are not "
+                          "current and must not drive today's priorities.")
+    return result
+
+
+def _memory_set_status_check(ctx: ToolContext, memory_id: int, status: str) -> str:
+    return ctx.memory.plan_status(int(memory_id), status).get("needs_confirmation") or ""
+
+
+def _memory_set_status(ctx: ToolContext, memory_id: int, status: str, confirmed: bool = False) -> dict:
+    try:
+        result = ctx.memory.set_status(int(memory_id), status, confirmed=confirmed)
+    except ValueError as e:
+        return {"error": str(e)}
+    if result["status"] not in ("unchanged", "needs_confirmation"):
+        ctx.log(f"Memory #{memory_id} → {status}")
+    return result
 
 
 def _memory_forget(ctx: ToolContext, memory_id: int) -> dict:
@@ -239,29 +332,62 @@ def build_registry() -> ToolRegistry:
     ))
     reg.register(Tool(
         "memory_remember",
-        "Save one genuinely useful long-term fact about the user (a goal, project, person, "
-        "commitment, preference, routine, business context, decision or follow-up). Never save "
-        "small talk, one-off chatter or things already in the calendar. After saving, just say "
-        "'Annotato.' (or 'Noted.' in English).",
+        "Save one durable, genuinely useful piece of information about her for the long term. "
+        "Choose kind precisely: fact = objectively true; preference = her taste or way of working; "
+        "goal = an outcome she is committed to; hypothesis = an idea she is considering or testing "
+        "(NOT decided); decision = something she has explicitly decided; plus project, person, "
+        "commitment, routine, followup, kpi. Never turn a hypothesis into a decision unless she clearly "
+        "says she has decided. status: active (default), future (a later target, not a current "
+        "priority) or paused. For single-valued things use slot_key so a new value replaces the old one "
+        "(history is kept): business.revenue_target.current, business.revenue_target.future, "
+        "business.offer, business.icp, business.niche, business.pricing, business.acquisition_channel, "
+        "business.delivery_model, or a clear dotted key like personal.home_city or equestrian.horse.<name>. "
+        "Changing an active goal or decision, or turning a hypothesis into a decision, returns "
+        "needs_confirmation: read it back and ask. Never save small talk, passing remarks, moods, "
+        "one-off chatter, things you only inferred, or what is already in the calendar. After saving, "
+        "just say 'Annotato.' (or 'Noted.').",
         _obj({
             "kind": {"type": "string", "enum": list(KINDS)},
+            "content": {"type": "string", "description": "the information, self-contained, in her language"},
             "subject": {"type": "string", "description": "who/what it is about, e.g. 'Giulia', 'revenue target'"},
-            "content": {"type": "string", "description": "the fact, self-contained, in the user's language"},
-            "importance": {"type": "integer", "description": "1 (minor) to 5 (core goal/priority)"},
+            "domain": {"type": "string", "enum": list(DOMAINS)},
+            "status": {"type": "string", "enum": ["active", "future", "paused"]},
+            "slot_key": {"type": "string"},
+            "data": {"type": "object", "description": "exact values, e.g. {\"amount\": 10000, \"currency\": \"EUR\", \"period\": \"month\"}"},
+            "importance": {"type": "integer", "description": "2 (useful) to 5 (core goal/priority)"},
+            "replaces_id": {"type": "integer", "description": "id of the memory this one replaces"},
+            "additional": {"type": "boolean", "description": "true if it is genuinely in addition to similar active ones"},
         }, ["kind", "content"]),
         _memory_remember,
+        confirm_check=_memory_remember_check,
     ))
     reg.register(Tool(
         "memory_recall",
-        "Search long-term memory (goals, projects, people, decisions, follow-ups…) by keywords "
-        "and/or kind. Use it before answering questions about the user's life, people, plans or business.",
-        _obj({"query": {"type": "string"}, "kind": {"type": "string"}, "limit": {"type": "integer"}}),
+        "Search long-term memory by keywords, kind and/or domain. By default returns only current "
+        "memories (active, future, paused). Set include_history=true only when she asks about the past "
+        "or history is clearly relevant (e.g. 'what was my old target?'); history never sets today's priorities.",
+        _obj({
+            "query": {"type": "string"}, "kind": {"type": "string"}, "domain": {"type": "string"},
+            "include_history": {"type": "boolean"}, "limit": {"type": "integer"},
+        }),
         _memory_recall,
     ))
     reg.register(Tool(
+        "memory_set_status",
+        "Change a memory's status (find its id with memory_recall): active, future, paused, completed "
+        "(achieved/done) or archived (no longer relevant, kept as history). Ending an active goal or "
+        "decision, or reactivating something archived, asks her to confirm.",
+        _obj({
+            "memory_id": {"type": "integer"},
+            "status": {"type": "string", "enum": ["active", "future", "paused", "completed", "archived"]},
+        }, ["memory_id", "status"]),
+        _memory_set_status,
+        confirm_check=_memory_set_status_check,
+    ))
+    reg.register(Tool(
         "memory_forget",
-        "Delete one long-term memory by id (find the id with memory_recall first). Requires the "
-        "user's confirmation.",
+        "Permanently delete one long-term memory by id (find the id with memory_recall first). Prefer "
+        "memory_set_status archived unless she wants it erased. Requires her confirmation.",
         _obj({"memory_id": {"type": "integer"}}, ["memory_id"]),
         _memory_forget,
         mutates=True,
