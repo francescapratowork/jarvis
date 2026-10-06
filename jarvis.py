@@ -74,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.14 (speech-to-text: verified TLS trust store)"
+JARVIS_VERSION = "2026-10-06.15 (Spotify: exactly one play command per startup)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -170,6 +170,10 @@ SPOTIFY_NORMAL_VOLUME = _volume(
 )
 # Seconds the song plays at full volume before ducking (so its beginning is clearly heard).
 MUSIC_LEAD_IN_SECONDS = max(0.0, _env_float("JARVIS_MUSIC_LEAD_IN_SECONDS", 7.0))
+# Starting the song: how long to wait (read-only) for Spotify to report "playing" after the
+# single play command, and how often the command may be sent if it never reached Spotify.
+SPOTIFY_START_WAIT_S = 15.0
+SPOTIFY_START_ATTEMPTS = 6
 # Seconds for the duck (full → duck volume); the voice starts once it's done.
 SPOTIFY_DUCK_FADE_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_DUCK_FADE_SECONDS", 0.5))
 # Seconds for the rise back to full volume after the voice.
@@ -937,53 +941,94 @@ def _spotify_running() -> bool:
         return False
 
 
-def _spotify_try_play(
-    command: str, attempts: int, start_volume: int | None = None
-) -> tuple[str, list[str]]:
-    """Run a Spotify play command until the player reports "playing".
+class SpotifyStatus:
+    """A read-only snapshot of Spotify's player (never changes playback)."""
 
-    `start_volume` (0–100) is applied to Spotify's own volume right before playing, so the
-    music never starts loud. Returns (status, fields): status is "ok" (fields: name,
-    artist, volume), "error" (fields: error number, message) or "notplaying" (fields:
-    state, last error).
-    """
-    volume = "" if start_volume is None else f"set sound volume to {_volume(start_volume)}"
-    # Note: AppleScript reserves short words such as st/nd/rd/th (ordinal suffixes, "1st"),
-    # so variables here use long descriptive names.
-    script = f"""
-set lastErr to ""
-repeat {attempts} times
+    def __init__(self, ok: bool, state: str = "", track_id: str = "", name: str = "",
+                 artist: str = "", error: str = "") -> None:
+        self.ok, self.state, self.track_id = ok, state, track_id
+        self.name, self.artist, self.error = name, artist, error
+
+    @property
+    def playing(self) -> bool:
+        return self.ok and self.state == "playing"
+
+
+def _spotify_status() -> SpotifyStatus:
+    """Ask Spotify what it is doing. Only reads; never sends play/pause/seek."""
+    # AppleScript reserves short words such as st/nd/rd/th, so variables use long names.
+    script = """
+tell application "Spotify"
+  set playerStateText to (player state as text)
+  set trackIdText to ""
+  set trackNameText to ""
+  set artistText to ""
   try
-    tell application "Spotify"
-      {volume}
-      {command}
-    end tell
-    repeat 8 times
-      delay 0.25
-      tell application "Spotify"
-        if player state is playing then
-          set nowPlaying to current track
-          return "ok|" & (name of nowPlaying) & "|" & (artist of nowPlaying) & "|" & (sound volume as text)
-        end if
-      end tell
-    end repeat
-  on error errMsg number errNum
-    set lastErr to (errNum as text) & "|" & errMsg
-    if errNum is -1743 then return "error|" & lastErr
+    set nowPlaying to current track
+    set trackIdText to (id of nowPlaying)
+    set trackNameText to (name of nowPlaying)
+    set artistText to (artist of nowPlaying)
   end try
-  delay 0.5
-end repeat
-set playerStateText to "unknown"
-try
-  tell application "Spotify" to set playerStateText to (player state as text)
-end try
-return "notplaying|" & playerStateText & "|" & lastErr
+  return playerStateText & "|" & trackIdText & "|" & trackNameText & "|" & artistText
+end tell
 """
-    ok, out, err = _osascript(script, timeout=attempts * 3.0 + 30)
+    ok, out, err = _osascript(script, timeout=10)
     if not ok:
-        return "error", ["", err]
-    status, _, rest = out.partition("|")
-    return status, rest.split("|")
+        return SpotifyStatus(False, error=err)
+    state, track_id, name, artist = (out.split("|") + ["", "", "", ""])[:4]
+    return SpotifyStatus(True, state.strip(), track_id.strip(), name, artist)
+
+
+def _spotify_wait_playing(seconds: float, uri: str = "", paused_grace_s: float = 8.0) -> SpotifyStatus:
+    """Watch (read-only) until Spotify reports "playing" or `seconds` pass. Also returns early
+    if `uri` sits loaded but paused for `paused_grace_s` (it will need a resume, not a restart).
+    Once playing, waits up to 2 s more for the track name (it can arrive a moment later)."""
+    deadline = time.monotonic() + seconds
+    paused_since = None
+    status = _spotify_status()
+    while not status.playing and time.monotonic() < deadline:
+        if uri and status.ok and status.state == "paused" and status.track_id == uri:
+            paused_since = paused_since or time.monotonic()
+            if time.monotonic() - paused_since >= paused_grace_s:
+                break
+        else:
+            paused_since = None
+        time.sleep(0.25)
+        status = _spotify_status()
+    name_deadline = time.monotonic() + 2.0
+    while status.playing and not status.name and time.monotonic() < name_deadline:
+        time.sleep(0.25)
+        status = _spotify_status()
+    return status
+
+
+def _is_permission_error(text: str) -> bool:
+    return "-1743" in text or "not authorized" in text.lower() or "not allowed" in text.lower()
+
+
+class SpotifyStarter:
+    """Starts the song for ONE Jarvis activation. Every command that can start (and so
+    restart) playback goes through send(), which counts and logs it. A normal startup sends
+    exactly one: `play track ...`. Waiting for the song to load only *reads* Spotify's state;
+    a command is re-sent only if the first one provably never reached Spotify (an Apple
+    event error) and nothing is playing or loaded, so audible music is never restarted."""
+
+    def __init__(self) -> None:
+        self.commands = 0
+
+    def send(self, description: str, script: str) -> tuple[bool, str]:
+        self.commands += 1
+        log.info("Spotify: playback-start command #%d sent: %s", self.commands, description)
+        ok, _, err = _osascript(script, timeout=20)
+        if not ok:
+            log.info("Spotify: command #%d was not accepted: %s", self.commands, err)
+        return ok, err
+
+    def report(self) -> None:
+        if self.commands == 1:
+            log.info("Spotify: startup sent exactly 1 playback-start command.")
+        else:
+            log.warning("Spotify: startup sent %d playback-start commands (expected 1).", self.commands)
 
 
 def _spotify_get_volume() -> int | None:
@@ -1135,17 +1180,46 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
         f"{previous}%" if previous is not None else "unknown",
     )
 
-    status, fields = _spotify_try_play(f"play track {_as_str(uri)}", 10, start_volume)
-    if status == "notplaying":
-        # Fallback: open the track via its spotify: link, then press play.
-        log.info("Spotify: not playing yet (state: %s); retrying via the track link...", fields[0])
+    starter = SpotifyStarter()
+    play_track = (
+        f'tell application "Spotify"\n'
+        f"  set sound volume to {_volume(start_volume)}\n"
+        f"  play track {_as_str(uri)}\n"
+        f"end tell"
+    )
+    delivered, err = starter.send(f"play track {uri} (volume {start_volume}%)", play_track)
+    status = SpotifyStatus(False, error=err)
+    while not _is_permission_error(err):
+        # Read-only: give the song time to load (a just-launched Spotify can be slow).
+        status = _spotify_wait_playing(SPOTIFY_START_WAIT_S if delivered else 1.5, uri)
+        if status.playing or delivered or starter.commands >= SPOTIFY_START_ATTEMPTS:
+            break
+        if status.ok and status.track_id == uri:
+            delivered = True  # it did arrive (our track is loaded): keep waiting, don't resend
+            continue
+        # The command never reached Spotify and nothing is playing: safe to send it again.
+        delivered, err = starter.send(f"play track {uri} (retry: previous command not delivered)", play_track)
+
+    if status.ok and not status.playing and status.track_id == uri:
+        # Our track is loaded but paused: resume it ("play" continues, it never restarts).
+        starter.send("play (resume the loaded track)", 'tell application "Spotify" to play')
+        status = _spotify_wait_playing(6.0)
+    elif status.ok and not status.playing and not _is_permission_error(err):
+        # Fallback, only when nothing is playing: open the track via its spotify: link.
+        log.info("Spotify: not playing (state: %s); trying the track link...", status.state or "unknown")
+        starter.commands += 1
+        log.info("Spotify: playback-start command #%d sent: open %s", starter.commands, uri)
         subprocess.run(["open", "-g", uri], check=False)
         UI.ensure_focus("after opening the track link")
-        time.sleep(1.5)
-        status, fields = _spotify_try_play("play", 6, start_volume)
+        status = _spotify_wait_playing(3.0, uri, paused_grace_s=1.0)
+        if status.ok and not status.playing:
+            starter.send("play (resume; the link loaded the track without playing it)",
+                         'tell application "Spotify" to play')
+            status = _spotify_wait_playing(6.0)
+    starter.report()
 
-    if status == "ok":
-        name, artist = (fields + ["", ""])[:2]
+    if status.playing:
+        name, artist = status.name, status.artist
         log.info(
             "Spotify: SUCCESS — playing \"%s\" by %s at %d%%.", name, artist, start_volume
         )
@@ -1155,24 +1229,21 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
             log=f"Audio link: {name} — {artist}",
         )
         return playback
-    if status == "error":
-        num, msg = (fields + ["", ""])[:2]
-        if num == "-1743" or "-1743" in msg or "not authorized" in msg.lower():
-            log.error(
-                "Spotify: ERROR — macOS did not allow Jarvis to control Spotify. Open System "
-                "Settings → Privacy & Security → Automation → Terminal and turn on Spotify, "
-                "then quit Terminal (Cmd+Q) and start again."
-            )
-        else:
-            log.error("Spotify: ERROR — %s %s", num, msg)
+    if _is_permission_error(err) or _is_permission_error(status.error):
+        log.error(
+            "Spotify: ERROR — macOS did not allow Jarvis to control Spotify. Open System "
+            "Settings → Privacy & Security → Automation → Terminal and turn on Spotify, "
+            "then quit Terminal (Cmd+Q) and start again."
+        )
+    elif not status.ok:
+        log.error("Spotify: ERROR — %s", status.error or err)
     else:
-        state, last = fields[0] if fields else "unknown", "|".join(fields[1:])
         log.error(
             "Spotify: ERROR — the app did not start playing (state: %s%s). Check that you are "
             "logged in, that the track plays when you click it in Spotify, and that no other "
             "device is controlling playback (Spotify Connect).",
-            state,
-            f"; last error: {last}" if last else "",
+            status.state or "unknown",
+            f"; last error: {err}" if err else "",
         )
     # Don't leave Spotify silent/ducked if it failed after we lowered its volume.
     if previous is not None:
