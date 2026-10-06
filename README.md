@@ -2,9 +2,9 @@
 
 A Python script that listens to your Mac's microphone. When you **clap twice**, it:
 
-1. starts your song in the **Spotify** app, fading in **quietly** (and tells you in Terminal whether it worked),
-2. speaks a welcome line in your **ElevenLabs** voice over the quiet music,
-3. when the voice finishes, **fades the music up** smoothly (Spotify's own volume only — your Mac's volume and other sounds are untouched),
+1. starts your song in the **Spotify** app at full volume, so you clearly hear it begin (and tells you in Terminal whether it worked),
+2. after ~0.3 s, smoothly **ducks** the music to 35% — still audible — and speaks a welcome line in your **ElevenLabs** voice over it,
+3. when the voice finishes, **fades the music back up** over ~2 s (Spotify's own volume only — your Mac's volume and other sounds are untouched),
 4. meanwhile opens **Claude** and **Tasaradar** in new **Google Chrome** windows (fullscreen, one per display if you have several) and brings **Cursor** to the front (fullscreen).
 
 **How it behaves:** start Jarvis → it measures your room for 1.5 s → waits for **one** valid double clap → **turns the microphone off** → runs the welcome once → stops. Nothing you say or type afterwards can trigger it again. To use it again, run `./start_jarvis.sh` again.
@@ -46,13 +46,14 @@ open -e ~/jarvis/.env
 | `ELEVENLABS_VOICE_ID` | The voice to use (ElevenLabs → Voices → ⋯ → Copy voice ID). Only the ID itself: letters and numbers, no spaces, no quotes, e.g. `ELEVENLABS_VOICE_ID=AbCdEf1234567890xyz`. | *(empty, no voice)* |
 | `JARVIS_WELCOME_PHRASE` | What Jarvis says. | `Welcome home, sir. All systems are online.` |
 | `JARVIS_WELCOME_ENABLED` | `false` turns the voice off. | `true` |
-| `JARVIS_AFTER_SONG_DELAY_S` | Seconds between the music starting and the voice starting. | `0.5` |
+| `JARVIS_AFTER_SONG_DELAY_S` | Seconds between the music starting and the voice starting — only for YouTube/web links, which can't be ducked. | `0.5` |
 | `JARVIS_SONG_URI` | Spotify link (`https://open.spotify.com/track/…` or `spotify:track:…`) or a YouTube link. | the original track |
-| `JARVIS_SPOTIFY_DUCK_VOLUME` | Spotify's volume (0–100) while the voice speaks. | `18` |
-| `JARVIS_SPOTIFY_NORMAL_VOLUME` | Volume the music fades up to after the voice (used when your previous Spotify volume is unknown or lower than the duck volume, or always if `JARVIS_SPOTIFY_RESTORE_PREVIOUS=false`). | `65` |
-| `JARVIS_SPOTIFY_RESTORE_PREVIOUS` | `true` = fade back up to the volume Spotify had before Jarvis started; `false` = always fade up to `JARVIS_SPOTIFY_NORMAL_VOLUME`. | `true` |
-| `JARVIS_SPOTIFY_FADE_SECONDS` | How long the fade-up after the voice takes. | `2.5` |
-| `JARVIS_SPOTIFY_FADE_IN_SECONDS` | How long the music takes to fade in from silence to the duck volume (`0` = start directly at the duck volume). | `1.0` |
+| `JARVIS_MUSIC_LEAD_IN_SECONDS` | How long the song plays at full volume before ducking. | `0.3` |
+| `JARVIS_SPOTIFY_DUCK_VOLUME` | Spotify's volume (0–100) while the voice speaks. | `35` |
+| `JARVIS_SPOTIFY_DUCK_FADE_SECONDS` | How long the duck (full → duck volume) takes; the voice starts when it's done. | `0.5` |
+| `JARVIS_SPOTIFY_NORMAL_VOLUME` | The song's full volume, at the start and after the voice (used when your previous Spotify volume is unknown or lower than the duck volume, or always if `JARVIS_SPOTIFY_RESTORE_PREVIOUS=false`). | `65` |
+| `JARVIS_SPOTIFY_RESTORE_PREVIOUS` | `true` = full volume is the volume Spotify had before Jarvis started; `false` = always `JARVIS_SPOTIFY_NORMAL_VOLUME`. | `true` |
+| `JARVIS_SPOTIFY_FADE_SECONDS` | How long the rise back to full volume after the voice takes. | `2.0` |
 | `CLAUDE_CODE_URL` | First Chrome window. | `https://claude.ai/new` |
 | `TASARADAR_URL` | Second Chrome window. `BINANCE_BTC_URL` from older setups is still read if this is empty. | `https://tasaradar.com` |
 | `OPEN_CLAUDE_CODE_IN_CHROME` / `OPEN_TASARADAR_IN_CHROME` | `false` skips that window. | `true` |
@@ -107,12 +108,13 @@ Stay quiet for the first two seconds while Jarvis measures the room noise. When 
 ```
 DOUBLE CLAP DETECTED!
 Microphone closed — Jarvis is no longer listening. Running the welcome sequence...
-Spotify: asking it to play spotify:track:…, starting quietly (Spotify volume was 70%)...
-Spotify: SUCCESS — playing "…" by ….
-Spotify: ducked — fading in to 18% over 1.0s, under the voice.
+Spotify: asking it to play spotify:track:… at 70% (your previous Spotify volume; Spotify volume was 70%)...
+Spotify: SUCCESS — playing "…" by … at 70%.
+Spotify: ducking 70% → 35% over 0.5s for the voice...
+Spotify: ducked to 35% (still audible under the voice).
 Welcome voice: speaking (6.2s)...
 Welcome voice: finished.
-Spotify: fading music up 18% → 70% over 2.5s (your previous Spotify volume)...
+Spotify: fading music up 35% → 70% over 2.0s (your previous Spotify volume)...
 …
 Spotify: restored to 70%.
 Welcome sequence finished. Jarvis has stopped. Run ./start_jarvis.sh to use it again.
@@ -175,7 +177,7 @@ Advanced shape checks (`CLAP_RMS_RATIO`, `MIN_HF_RATIO`, `MAX_CLAP_LEN_S`, `QUIE
 - **No music:** Look for the `Spotify:` lines in Terminal. They say `SUCCESS` with the song name, or what went wrong:
   - *did not allow Jarvis to control Spotify*: turn on Spotify under **System Settings → Privacy & Security → Automation → Terminal**, quit Terminal (Cmd+Q), start again.
   - *did not start playing*: open Spotify, check you're logged in and the track plays when you click it, and that Spotify isn't playing on another device (the speaker icon at the bottom right).
-  - *music too loud/quiet under the voice*: change `JARVIS_SPOTIFY_DUCK_VOLUME` (e.g. `12` or `25`); after the voice, `JARVIS_SPOTIFY_NORMAL_VOLUME`.
+  - *music too loud/quiet under the voice*: change `JARVIS_SPOTIFY_DUCK_VOLUME` (e.g. `25` or `45`); after the voice, `JARVIS_SPOTIFY_NORMAL_VOLUME`.
   - Also check your Mac isn't muted. Jarvis warns if it is.
 - **Windows don't go fullscreen:** Give Terminal Accessibility access (see above).
 - **No welcome speech:** Check `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`, and look for an `ElevenLabs TTS failed` line in Terminal. A `404 Not Found` whose address contains something other than your voice ID (e.g. `/v1/text-to-speech/open%20-e%20...`) means the `ELEVENLABS_VOICE_ID=` line holds the wrong text: put only the voice ID after the `=`.
