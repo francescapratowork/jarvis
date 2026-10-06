@@ -3,3 +3,5 @@ sounddevice>=0.4.6,<0.6
 elevenlabs>=1.50,<3
 websockets>=13
 python-dotenv>=1.0,<2
+# Full-screen interface (native macOS window with WebKit)
+pywebview>=5,<7; sys_platform == "darwin"

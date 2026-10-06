@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Jarvis for macOS: listens to your Mac microphone and, on a double clap, runs a welcome
-sequence (Spotify track, Chrome windows, ElevenLabs voice, Cursor).
+Jarvis for macOS: listens to your Mac microphone and, on a double clap, opens the full-screen
+Jarvis interface and runs a welcome sequence (Spotify track in the background, ElevenLabs voice).
 
 Run:
   ./start_jarvis.sh            (first run creates a virtualenv and installs dependencies)
@@ -14,7 +14,7 @@ Everything a user is likely to change can be set in a `.env` file next to this s
 
 Clap detection:
   Production: calibrate → wait for ONE valid double clap → close the microphone → run the
-  welcome once → exit. `./start_jarvis.sh --test` keeps listening and only logs claps.
+  welcome once → keep the interface open until the user closes it. `./start_jarvis.sh --test` keeps listening and only logs claps.
   The threshold is room noise × JARVIS_SPIKE_RATIO (re-measured continuously), but never below
   JARVIS_MIN_CLAP_PEAK. Each loud sound is then checked: short (voice/music last longer),
   energetic (40 ms rms ≥ JARVIS_MIN_CLAP_RMS; clicks/keys are thin), bright (voices/thumps
@@ -33,21 +33,19 @@ Clap detection:
 Actions (macOS):
   SONG_URI      — Spotify or YouTube URL/URI (env JARVIS_SONG_URI). Spotify links are played in
                     the Spotify app via AppleScript; anything else opens in the default browser.
-  OPEN_CLAUDE_CODE_IN_CHROME / OPEN_TASARADAR_IN_CHROME — open each site in a new Chrome window
-    (CLAUDE_CODE_URL / TASARADAR_URL), placed on CLAUDE_CHROME_MONITOR / TASARADAR_CHROME_MONITOR
-    (1-based, displays sorted left-to-right then top-to-bottom).
-  OPEN_CHROME_FULLSCREEN / CURSOR_OPEN_FULLSCREEN — native macOS fullscreen (needs Accessibility
-    permission for your Terminal app). Without that permission the window just fills the screen.
-  CHROME_SEPARATE_SITE_PROFILES — if True, uses a temp --user-data-dir per site (not your normal
-    profile). Default False so Claude/Tasaradar use your usual Chrome profile and logins.
-  FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP — bring Cursor to the front (launches it if not running).
-  OPEN_NEW_CURSOR_ON_DOUBLE_CLAP — also open a new Cursor window.
+  JARVIS_UI_ENABLED — full-screen animated interface (ui/index.html in a native window, run by
+    jarvis_ui.py as a separate process; states STARTING/ONLINE/LISTENING/THINKING/SPEAKING).
+    `./start_jarvis.sh --ui-demo` previews it without microphone, music or voice.
+  No work apps or websites are opened automatically. The Chrome/Cursor helpers
+    (open_claude_in_chrome, open_tasaradar_in_chrome, open_cursor_window) remain for future
+    voice commands but are not called.
   JARVIS_WELCOME_* — TTS after the song (ElevenLabs), played through the default output device.
     With JARVIS_WELCOME_CACHE_ENABLED, audio is saved under `.cache/jarvis_welcome/` (WAV) and
     replayed when phrase + voice + model + format match—no repeat API call. Delete that folder
     or set JARVIS_WELCOME_CACHE_ENABLED=false to force a fresh fetch.
-  The welcome sequence runs only once per process: Spotify starts quietly (ducked, its own
-    volume only), the voice speaks over it, then the music fades up while Chrome and Cursor open.
+  The welcome sequence runs only once per process: the interface opens, Spotify starts hidden
+    at full volume, after JARVIS_MUSIC_LEAD_IN_SECONDS it ducks (its own volume only), the
+    voice speaks over it, then the music fades up and the interface shows AWAITING COMMAND.
   JARVIS_MUSIC_LEAD_IN_SECONDS / JARVIS_SPOTIFY_DUCK_VOLUME / _DUCK_FADE_SECONDS /
     _NORMAL_VOLUME / _RESTORE_PREVIOUS / _FADE_SECONDS — audio ducking (see .env.example).
 """
@@ -76,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.10 (song plays 10 s at full volume before ducking)"
+JARVIS_VERSION = "2026-10-06.11 (full-screen interface, 7 s lead-in, no auto-opened apps)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -171,7 +169,7 @@ SPOTIFY_NORMAL_VOLUME = _volume(
     )
 )
 # Seconds the song plays at full volume before ducking (so its beginning is clearly heard).
-MUSIC_LEAD_IN_SECONDS = max(0.0, _env_float("JARVIS_MUSIC_LEAD_IN_SECONDS", 10.0))
+MUSIC_LEAD_IN_SECONDS = max(0.0, _env_float("JARVIS_MUSIC_LEAD_IN_SECONDS", 7.0))
 # Seconds for the duck (full → duck volume); the voice starts once it's done.
 SPOTIFY_DUCK_FADE_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_DUCK_FADE_SECONDS", 0.5))
 # Seconds for the rise back to full volume after the voice.
@@ -206,6 +204,9 @@ JARVIS_WELCOME_ENABLED = _env_bool("JARVIS_WELCOME_ENABLED", True)
 JARVIS_WELCOME_PHRASE = _env_str(
     "JARVIS_WELCOME_PHRASE", "Welcome home, sir. All systems are online."
 )
+# Full-screen Jarvis interface (ui/index.html in a native window, see jarvis_ui.py).
+JARVIS_UI_ENABLED = _env_bool("JARVIS_UI_ENABLED", True)
+
 # Seconds between the music starting and the voice starting, used only when the music can't
 # be ducked (YouTube/web player links). With the Spotify app the voice starts right after the
 # lead-in + duck.
@@ -440,6 +441,120 @@ def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
         raise
 
 
+class JarvisUI:
+    """Client for the full-screen interface process (jarvis_ui.py).
+
+    Messages are JSON lines on the child's stdin. Every method is a safe no-op when the
+    interface is disabled, failed to start, or was closed by the user.
+    """
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+        self._reported_dead = False
+
+    def start(self) -> bool:
+        if not JARVIS_UI_ENABLED:
+            return False
+        script = Path(__file__).resolve().parent / "jarvis_ui.py"
+        if not script.is_file():
+            log.warning("Jarvis interface: %s is missing — skipping the interface.", script.name)
+            return False
+        try:
+            self.proc = subprocess.Popen(
+                [sys.executable, str(script)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as e:
+            log.warning("Jarvis interface: could not start (%s).", e)
+            self.proc = None
+            return False
+        log.info("Jarvis interface: opening full screen...")
+        threading.Thread(target=self._telemetry, daemon=True).start()
+        return True
+
+    def alive(self) -> bool:
+        if self.proc is None:
+            return False
+        if self.proc.poll() is None:
+            return True
+        if not self._reported_dead and self.proc.returncode not in (0, None):
+            self._reported_dead = True
+            log.warning(
+                "Jarvis interface: exited with code %s (see the message above; run "
+                "./start_jarvis.sh to install missing packages).",
+                self.proc.returncode,
+            )
+        return False
+
+    def send(self, **msg) -> None:
+        if not self.alive():
+            return
+        try:
+            with self._lock:
+                self.proc.stdin.write(json.dumps(msg) + "\n")
+                self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def focus(self) -> None:
+        """Bring the interface back to the front (e.g. after Spotify was launched)."""
+        self.send(focus=True)
+
+    def wait_closed(self) -> None:
+        if self.proc is not None:
+            self.proc.wait()
+
+    def close(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+
+    def _telemetry(self) -> None:
+        cpus = os.cpu_count() or 1
+        while self.alive():
+            try:
+                self.send(cpu=round(min(1.0, os.getloadavg()[0] / cpus), 3))
+            except OSError:
+                pass
+            time.sleep(2.0)
+
+
+UI = JarvisUI()
+
+
+def _voice_envelope(pcm: np.ndarray, rate: int, frame_s: float = 0.05) -> np.ndarray:
+    """Loudness of the voice per 50 ms frame, scaled 0..1 (drives the SPEAKING animation)."""
+    n = max(1, int(rate * frame_s))
+    frames = len(pcm) // n
+    if frames == 0:
+        return np.zeros(1, dtype=np.float32)
+    rms = np.sqrt(np.mean(pcm[: frames * n].reshape(frames, n) ** 2, axis=1))
+    ref = float(np.percentile(rms, 95)) or 1.0
+    return np.sqrt(np.clip(rms / ref, 0.0, 1.0)).astype(np.float32)
+
+
+def _stream_voice_levels(env: np.ndarray, frame_s: float, stop: threading.Event) -> None:
+    start = time.monotonic()
+    while not stop.is_set():
+        i = int((time.monotonic() - start) / frame_s)
+        if i >= len(env):
+            break
+        UI.send(level=round(float(env[i]), 3))
+        time.sleep(frame_s)
+    UI.send(level=0)
+
+
 def prepare_welcome_audio() -> tuple[np.ndarray, int] | None:
     """Load the spoken welcome (from cache, or from ElevenLabs) without playing it, so it can
     be fetched while Spotify is starting. Returns (samples, sample_rate) or None."""
@@ -496,13 +611,23 @@ def prepare_welcome_audio() -> tuple[np.ndarray, int] | None:
 def play_welcome_audio(pcm: np.ndarray, rate: int) -> bool:
     """Play the spoken welcome through the default output and wait until it has finished."""
     log.info("Welcome voice: speaking (%.1fs)...", len(pcm) / max(1, rate))
+    UI.send(state="SPEAKING", log="Voice: speaking", highlight=True)
+    stop = threading.Event()
+    levels = threading.Thread(
+        target=_stream_voice_levels, args=(_voice_envelope(pcm, rate), 0.05, stop), daemon=True
+    )
     try:
         sd.play(pcm, rate)
+        levels.start()
         sd.wait()
     except Exception as e:
         log.warning("Could not play ElevenLabs audio: %s", e)
         return False
+    finally:
+        stop.set()
+        UI.send(state="ONLINE", voice="READY", level=0)
     log.info("Welcome voice: finished.")
+    UI.send(log="Voice: finished")
     return True
 
 
@@ -828,6 +953,7 @@ class SpotifyPlayback:
                 self.full_volume,
                 MUSIC_LEAD_IN_SECONDS,
             )
+            UI.send(boot={"seconds": MUSIC_LEAD_IN_SECONDS})
             time.sleep(MUSIC_LEAD_IN_SECONDS)
 
     def duck(self) -> None:
@@ -843,6 +969,11 @@ class SpotifyPlayback:
             SPOTIFY_DUCK_FADE_SECONDS,
         )
         self.ducked = True
+        UI.send(
+            state="ONLINE",
+            volume_fade={"to": self.duck_volume, "seconds": SPOTIFY_DUCK_FADE_SECONDS},
+            log=f"Audio ducked to {self.duck_volume}%",
+        )
         if _spotify_fade(self.full_volume, self.duck_volume, SPOTIFY_DUCK_FADE_SECONDS):
             log.info("Spotify: ducked to %d%% (still audible under the voice).", self.duck_volume)
 
@@ -860,6 +991,10 @@ class SpotifyPlayback:
             seconds,
             self.full_reason,
         )
+        UI.send(
+            volume_fade={"to": self.full_volume, "seconds": seconds},
+            log=f"Audio restored to {self.full_volume}%",
+        )
         if _spotify_fade(self.duck_volume, self.full_volume, seconds):
             log.info("Spotify: restored to %d%%.", self.full_volume)
 
@@ -868,14 +1003,16 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
     """Launch Spotify if needed and play `uri` at full volume, logging a clear result.
     Returns a SpotifyPlayback to duck/restore the music, or None on failure."""
     if not _spotify_running():
-        log.info("Spotify: starting the app...")
-        subprocess.run(["open", "-g", "-a", "Spotify"], check=False)
+        log.info("Spotify: starting the app in the background (hidden)...")
+        # -g: don't bring it to the front; -j: launch it hidden. Jarvis keeps the screen.
+        subprocess.run(["open", "-g", "-j", "-a", "Spotify"], check=False)
         deadline = time.monotonic() + 20
         while not _spotify_running() and time.monotonic() < deadline:
             time.sleep(0.5)
         if not _spotify_running():
             log.error("Spotify: ERROR — the app did not start within 20 seconds.")
             return None
+        UI.focus()
         time.sleep(3)  # let it log in and load the player
     previous = _spotify_get_volume()
     playback = SpotifyPlayback(previous)
@@ -893,6 +1030,7 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
         # Fallback: open the track via its spotify: link, then press play.
         log.info("Spotify: not playing yet (state: %s); retrying via the track link...", fields[0])
         subprocess.run(["open", "-g", uri], check=False)
+        UI.focus()
         time.sleep(1.5)
         status, fields = _spotify_try_play("play", 6, start_volume)
 
@@ -900,6 +1038,11 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
         name, artist = (fields + ["", ""])[:2]
         log.info(
             "Spotify: SUCCESS — playing \"%s\" by %s at %d%%.", name, artist, start_volume
+        )
+        UI.focus()
+        UI.send(
+            music={"track": name, "artist": artist, "volume": start_volume},
+            log=f"Audio link: {name} — {artist}",
         )
         return playback
     if status == "error":
@@ -1110,20 +1253,19 @@ def open_cursor_window() -> None:
         _mac_set_fullscreen("Cursor", wait_s=15.0)
 
 
-def open_workspace() -> None:
-    open_claude_in_chrome()
-    open_tasaradar_in_chrome()
-    open_cursor_window()
-
-
 def run_double_clap_actions() -> None:
-    """The welcome sequence. Runs once, after the microphone is closed, and returns only
-    when everything has finished:
+    """The welcome sequence. Runs once, after the microphone is closed:
 
-      song starts at full volume → after JARVIS_MUSIC_LEAD_IN_SECONDS it ducks (still
-      audible) → the voice speaks over it → the voice finishes → the song rises back
-      smoothly while the workspace (Chrome, Cursor) opens.
+      full-screen interface opens (STARTING) → song starts at full volume in the background
+      (Spotify stays hidden) → JARVIS_MUSIC_LEAD_IN_SECONDS while the interface boots →
+      song ducks (still audible) → the voice speaks over it (SPEAKING) → the voice
+      finishes → the song rises back → the interface shows AWAITING COMMAND and stays
+      open until the user closes it (Esc twice / power button / Cmd+Q, or Ctrl+C here).
+
+    No work apps or websites are opened automatically any more.
     """
+    UI.start()
+    UI.send(state="STARTING", mic="closed", log="Double clap confirmed", highlight=True)
     if IS_MAC:
         _check_mac_output_volume()
 
@@ -1131,9 +1273,13 @@ def run_double_clap_actions() -> None:
     prepared: dict = {}
     prep: threading.Thread | None = None
     if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
-        prep = threading.Thread(
-            target=lambda: prepared.update(audio=prepare_welcome_audio()), daemon=True
-        )
+
+        def _prepare() -> None:
+            prepared["audio"] = prepare_welcome_audio()
+            if prepared["audio"] is not None:
+                UI.send(voice="READY", log="Voice module ready")
+
+        prep = threading.Thread(target=_prepare, daemon=True)
         prep.start()
 
     music: SpotifyPlayback | None = None
@@ -1142,7 +1288,7 @@ def run_double_clap_actions() -> None:
 
         if prep is not None:
             if music is not None:
-                music.lead_in()  # the song's beginning at full volume
+                music.lead_in()  # the song at full volume while the interface boots
                 voice_missing = not prep.is_alive() and prepared.get("audio") is None
                 if not voice_missing:
                     music.duck()  # the voice starts as soon as the duck is done
@@ -1152,22 +1298,67 @@ def run_double_clap_actions() -> None:
                     time.sleep(delay)
             prep.join(timeout=30)
             audio = prepared.get("audio")
+            UI.send(state="ONLINE", log="Core online")
             if audio is not None:
                 play_welcome_audio(*audio)
             else:
                 log.warning("Welcome voice: not available — continuing without it.")
+        elif music is not None:
+            music.lead_in()
 
-        fade_up: threading.Thread | None = None
         if music is not None:
-            fade_up = threading.Thread(target=music.restore, daemon=True)
-            fade_up.start()
-        open_workspace()
-        if fade_up is not None:
-            fade_up.join(timeout=SPOTIFY_FADE_SECONDS + 30)
+            music.restore()
     finally:
         # Interrupted (Ctrl+C) or failed midway: never leave the music ducked.
         if music is not None and not music.restored:
             music.restore(fade=False)
+
+    UI.send(state="ONLINE", prompt="AWAITING COMMAND", log="Awaiting command")
+    if UI.alive():
+        log.info(
+            "Jarvis interface is open and awaiting commands. Close it with Esc twice, the "
+            "power button or Cmd+Q (or press Ctrl+C here)."
+        )
+        try:
+            UI.wait_closed()
+        finally:
+            UI.close()
+        log.info("Jarvis interface closed.")
+
+
+def run_ui_demo() -> int:
+    """`./start_jarvis.sh --ui-demo`: preview the interface and its states (no microphone,
+    no Spotify, no ElevenLabs). Close it with Esc twice or Cmd+Q."""
+    if not UI.start():
+        log.error("Jarvis interface could not start (JARVIS_UI_ENABLED=false?).")
+        return 1
+    script = [
+        (0.5, dict(state="STARTING", log="UI demo — no audio", highlight=True)),
+        (0.5, dict(music={"track": "Demo Track", "artist": "Jarvis", "volume": 65}, log="Audio link: demo")),
+        (0.3, dict(boot={"seconds": MUSIC_LEAD_IN_SECONDS}, voice="READY", log="Voice module ready")),
+        (MUSIC_LEAD_IN_SECONDS, dict(state="ONLINE", volume_fade={"to": 35, "seconds": 0.5}, log="Audio ducked to 35%")),
+        (0.6, dict(state="SPEAKING", log="Voice: speaking", highlight=True)),
+    ]
+    try:
+        for delay, msg in script:
+            time.sleep(delay)
+            UI.send(**msg)
+        for i in range(120):  # ~6 s of synthetic speech levels
+            UI.send(level=round(0.25 + 0.7 * abs(np.sin(i / 3.1)) * (0.6 + 0.4 * np.sin(i / 11)), 3))
+            time.sleep(0.05)
+        UI.send(state="ONLINE", prompt="AWAITING COMMAND", level=0, voice="READY",
+                volume_fade={"to": 65, "seconds": 2.0}, log="Voice: finished")
+        cycle = [("LISTENING", "open"), ("THINKING", "closed"), ("ONLINE", "closed")]
+        while UI.alive():
+            for state, mic in cycle:
+                time.sleep(6)
+                prompt = "AWAITING COMMAND" if state == "ONLINE" else None
+                UI.send(state=state, mic=mic, prompt=prompt, log=f"Demo state: {state}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        UI.close()
+    return 0
 
 
 def _hf_ratio(seg: np.ndarray) -> float:
@@ -1359,6 +1550,9 @@ def _describe(info: dict) -> str:
 
 
 def main() -> int:
+    if "--ui-demo" in sys.argv[1:]:
+        log.info("Jarvis version %s — interface demo", JARVIS_VERSION)
+        return run_ui_demo()
     test_mode = "--test" in sys.argv[1:] or _env_bool("JARVIS_TEST_MODE", False)
     log.info("Jarvis version %s — running %s", JARVIS_VERSION, Path(__file__).resolve())
     log.info("Settings file: %s (%s)", ENV_PATH, "found" if ENV_PATH.is_file() else "NOT FOUND")
@@ -1392,27 +1586,10 @@ def main() -> int:
     if not test_mode:
         if SONG_URI.strip():
             log.info("Double clap plays this track: %s", SONG_URI.strip())
-        if OPEN_CLAUDE_CODE_IN_CHROME:
-            log.info(
-                "Then open Claude in Chrome%s on display %d: %s",
-                " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
-                CLAUDE_CHROME_MONITOR,
-                CLAUDE_CODE_URL,
-            )
-        if OPEN_TASARADAR_IN_CHROME:
-            log.info(
-                "Then open Tasaradar in Chrome%s on display %d: %s",
-                " fullscreen" if OPEN_CHROME_FULLSCREEN else "",
-                TASARADAR_CHROME_MONITOR,
-                TASARADAR_URL,
-            )
-        if FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP:
-            log.info(
-                "Then bring Cursor to the front (launching it if needed)%s.",
-                " in fullscreen" if CURSOR_OPEN_FULLSCREEN else "",
-            )
-        if OPEN_NEW_CURSOR_ON_DOUBLE_CLAP:
-            log.info("Double clap will also open a new Cursor window.")
+        log.info(
+            "Double clap opens the full-screen Jarvis interface%s; no other apps are opened.",
+            "" if JARVIS_UI_ENABLED else " (disabled: JARVIS_UI_ENABLED=false)",
+        )
         if JARVIS_WELCOME_ENABLED:
             ev, em, ef, er = elevenlabs_env_config()
             log.info(

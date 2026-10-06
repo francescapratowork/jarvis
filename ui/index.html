@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS</title>
+<style>
+  :root {
+    --bg: #01070a;
+    --bg-2: #031016;
+    --panel: rgba(4, 22, 29, 0.55);
+    --line: rgba(34, 211, 238, 0.16);
+    --line-strong: rgba(34, 211, 238, 0.38);
+    --cyan: #22d3ee;
+    --cyan-hi: #8bf3ff;
+    --cyan-dim: #1b7f8f;
+    --text: #a9eef7;
+    --text-dim: #2d6f7b;
+    --text-faint: #1a4650;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "JetBrains Mono", "DejaVu Sans Mono", monospace;
+    --side: clamp(270px, 22vw, 400px);
+    --gap: clamp(14px, 1.4vw, 24px);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background:
+      radial-gradient(ellipse 70% 60% at 50% 52%, rgba(14, 116, 144, 0.10), transparent 70%),
+      radial-gradient(ellipse 120% 90% at 50% 50%, var(--bg-2), var(--bg) 70%);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: clamp(10px, 0.78vw, 13px);
+    letter-spacing: 0.04em;
+    cursor: default;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* faint grid + scanlines */
+  body::before, body::after {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  }
+  body::before {
+    background-image:
+      linear-gradient(rgba(34, 211, 238, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(34, 211, 238, 0.035) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse 75% 70% at 50% 50%, #000 30%, transparent 85%);
+    -webkit-mask-image: radial-gradient(ellipse 75% 70% at 50% 50%, #000 30%, transparent 85%);
+  }
+  body::after {
+    background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 3px);
+    opacity: 0.35;
+  }
+
+  .app { position: relative; z-index: 1; height: 100%; display: grid; grid-template-rows: auto 1fr; }
+
+  /* ---------------- header ---------------- */
+  header {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+    padding: 14px calc(var(--gap) * 1.2);
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(3, 18, 24, 0.85), rgba(3, 18, 24, 0.35));
+    animation: fadeDown 0.9s ease-out both;
+  }
+  .brand { display: flex; align-items: center; gap: 16px; }
+  .logo { width: 26px; height: 26px; position: relative; }
+  .logo i {
+    position: absolute; inset: 4px; border: 1px solid var(--cyan); transform: rotate(45deg);
+    box-shadow: 0 0 12px rgba(34, 211, 238, 0.45), inset 0 0 8px rgba(34, 211, 238, 0.35);
+    animation: logoSpin 9s linear infinite;
+  }
+  .logo i + i { inset: 9px; background: var(--cyan); animation: logoPulse 2.4s ease-in-out infinite; }
+  .brand h1 { font-size: 1.35em; letter-spacing: 0.42em; color: var(--cyan-hi); font-weight: 700; text-shadow: 0 0 14px rgba(34, 211, 238, 0.55); }
+  .brand small { display: block; margin-top: 4px; font-size: 0.78em; letter-spacing: 0.16em; color: var(--text-dim); }
+  .hstats { display: flex; gap: clamp(20px, 2.6vw, 44px); }
+  .hstat span { display: block; font-size: 0.78em; letter-spacing: 0.18em; color: var(--text-dim); }
+  .hstat b { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 1.05em; color: var(--cyan-hi); letter-spacing: 0.1em; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 10px var(--cyan); animation: blink 1.6s ease-in-out infinite; }
+  .hright { display: flex; justify-content: flex-end; align-items: center; gap: 18px; }
+  .icon-btn { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 8px; color: var(--cyan-dim); background: none; cursor: pointer; transition: all 0.25s; }
+  .icon-btn:hover { color: var(--cyan-hi); border-color: var(--line-strong); box-shadow: 0 0 14px rgba(34, 211, 238, 0.2); }
+  .icon-btn svg { width: 18px; height: 18px; }
+  .chip { display: flex; align-items: center; gap: 12px; padding: 6px 6px 6px 16px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--cyan-hi); letter-spacing: 0.14em; font-weight: 600; }
+  .chip .orb { width: 30px; height: 30px; border-radius: 50%; background: radial-gradient(circle at 35% 35%, #0e5b69, #031a20 70%); border: 1px solid var(--line-strong); box-shadow: inset 0 0 10px rgba(34, 211, 238, 0.25); }
+
+  /* ---------------- layout ---------------- */
+  main {
+    display: grid; grid-template-columns: var(--side) 1fr var(--side);
+    gap: var(--gap); padding: var(--gap) calc(var(--gap) * 1.2) calc(var(--gap) * 1.1);
+    min-height: 0;
+  }
+  .col { display: flex; flex-direction: column; gap: var(--gap); min-height: 0; }
+  .col.left .panel:nth-child(1) { flex: 1.25; }
+  .col.left .panel:nth-child(2) { flex: 1; }
+  .col.left .panel:nth-child(3) { flex: 1.05; }
+  .col.right .panel:nth-child(1) { flex: 0.95; }
+  .col.right .panel:nth-child(2) { flex: 1.6; }
+  .col.right .panel:nth-child(3) { flex: 0.7; }
+
+  .panel {
+    position: relative; min-height: 0; overflow: hidden;
+    padding: clamp(12px, 1.1vw, 18px) clamp(14px, 1.2vw, 20px);
+    background: linear-gradient(180deg, rgba(5, 26, 34, 0.55), rgba(3, 14, 19, 0.45));
+    border: 1px solid var(--line);
+    box-shadow: inset 0 0 40px rgba(34, 211, 238, 0.03);
+    opacity: 0; animation: panelIn 0.9s cubic-bezier(.2,.7,.2,1) both;
+  }
+  .panel::before, .panel::after { content: ""; position: absolute; width: 10px; height: 10px; border: 2px solid var(--cyan); opacity: 0.8; }
+  .panel::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
+  .panel::after { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
+  .panel .pips { position: absolute; top: 8px; right: 10px; display: flex; gap: 4px; }
+  .panel .pips i { width: 3px; height: 3px; border-radius: 50%; background: var(--cyan-dim); }
+  .ph { display: flex; justify-content: space-between; align-items: flex-start; padding-bottom: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .ph h2 { font-size: 0.95em; letter-spacing: 0.32em; font-weight: 500; color: var(--text-dim); }
+  .ph h3 { margin-top: 5px; font-size: 1em; letter-spacing: 0.2em; color: var(--cyan); font-weight: 600; }
+  .ph em { font-style: normal; font-size: 0.8em; letter-spacing: 0.14em; color: var(--text-faint); margin-top: 2px; }
+  .label { font-size: 0.82em; letter-spacing: 0.16em; color: var(--text-dim); }
+  .val { color: var(--cyan-hi); font-weight: 600; letter-spacing: 0.06em; }
+
+  .left .panel:nth-child(1) { animation-delay: 0.25s; }
+  .left .panel:nth-child(2) { animation-delay: 0.45s; }
+  .left .panel:nth-child(3) { animation-delay: 0.65s; }
+  .right .panel:nth-child(1) { animation-delay: 0.35s; }
+  .right .panel:nth-child(2) { animation-delay: 0.55s; }
+  .right .panel:nth-child(3) { animation-delay: 0.75s; }
+
+  /* audio panel */
+  .track { font-size: 1.35em; color: var(--cyan-hi); font-weight: 600; letter-spacing: 0.03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 0 12px rgba(34, 211, 238, 0.35); }
+  .artist { margin-top: 4px; color: var(--text-dim); letter-spacing: 0.1em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .spectrum { display: flex; align-items: flex-end; gap: 3px; height: clamp(44px, 7vh, 80px); margin: 14px 0 12px; padding: 6px; border: 1px solid var(--line); background: rgba(2, 12, 16, 0.5); }
+  .spectrum i { flex: 1; background: linear-gradient(180deg, var(--cyan), rgba(34, 211, 238, 0.25)); height: 8%; transition: height 0.12s linear; box-shadow: 0 0 6px rgba(34, 211, 238, 0.25); }
+  .row { display: flex; justify-content: space-between; align-items: baseline; margin: 10px 0 7px; }
+  .bar { height: 3px; background: rgba(34, 211, 238, 0.12); position: relative; overflow: hidden; }
+  .bar i { position: absolute; inset: 0 auto 0 0; width: 0%; background: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
+
+  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .kv div { padding: 10px 12px; border: 1px solid var(--line); background: rgba(2, 12, 16, 0.45); }
+  .kv .val { display: block; margin-top: 6px; font-size: 1.15em; }
+
+  .scope { width: 100%; height: clamp(54px, 9vh, 110px); display: block; border: 1px solid var(--line); background: rgba(2, 12, 16, 0.5); }
+
+  /* status tiles */
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .tile { aspect-ratio: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--line-strong); background: rgba(2, 14, 19, 0.6); color: var(--cyan-dim); transition: all 0.4s; }
+  .tile svg { width: 40%; max-width: 22px; height: auto; }
+  .tile small { font-size: 0.72em; letter-spacing: 0.16em; }
+  .tile.on { color: var(--cyan-hi); box-shadow: inset 0 0 18px rgba(34, 211, 238, 0.18), 0 0 14px rgba(34, 211, 238, 0.12); border-color: var(--cyan-dim); }
+  .tile.on svg { filter: drop-shadow(0 0 6px var(--cyan)); }
+  .meters { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .meters .val { display: block; margin: 6px 0 8px; font-size: 1.15em; }
+
+  /* log */
+  .log { list-style: none; font-size: 0.92em; line-height: 1.9; overflow: hidden; height: calc(100% - 52px); display: flex; flex-direction: column; justify-content: flex-start; }
+  .log li { display: flex; gap: 12px; white-space: nowrap; animation: logIn 0.5s ease-out both; }
+  .log li time { color: var(--text-faint); }
+  .log li span { color: var(--cyan); overflow: hidden; text-overflow: ellipsis; }
+  .log li.hl span { color: var(--cyan-hi); text-shadow: 0 0 8px rgba(34, 211, 238, 0.5); }
+
+  .term { border: 1px solid var(--line-strong); padding: 12px 14px; background: rgba(1, 8, 11, 0.7); }
+  .term p { color: var(--cyan); }
+  .term p::before { content: "›_ "; color: var(--cyan-hi); }
+  .term small { display: block; margin-top: 8px; color: var(--text-dim); font-style: italic; letter-spacing: 0.06em; }
+  .caret { display: inline-block; width: 8px; height: 1.1em; vertical-align: -2px; background: var(--cyan); margin-left: 4px; animation: blink 1s steps(1) infinite; }
+
+  /* ---------------- center ---------------- */
+  .stage { position: relative; min-height: 0; display: grid; grid-template-rows: 1fr auto; }
+  .frame { position: absolute; inset: 0 0 0 0; pointer-events: none; }
+  .frame i { position: absolute; width: 34%; height: 22%; border-color: var(--line); border-style: solid; opacity: 0; animation: fadeIn 1.2s 0.4s ease-out both; }
+  .frame i:nth-child(1) { top: 0; left: 0; border-width: 1px 0 0 1px; }
+  .frame i:nth-child(2) { top: 0; right: 0; border-width: 1px 1px 0 0; }
+  .frame i:nth-child(3) { bottom: 0; left: 0; border-width: 0 0 1px 1px; }
+  .frame i:nth-child(4) { bottom: 0; right: 0; border-width: 0 1px 1px 0; }
+  #core { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .corelabel { position: absolute; left: 50%; top: 44%; transform: translate(-50%, -78%); text-align: center; pointer-events: none; }
+  .corelabel small { display: block; font-size: 0.8em; letter-spacing: 0.5em; color: var(--cyan-dim); margin-left: 0.5em; }
+  .corelabel b { display: block; margin-top: 6px; font-size: clamp(13px, 1.2vw, 20px); letter-spacing: 0.32em; margin-left: 0.32em; color: var(--cyan-hi); text-shadow: 0 0 18px rgba(34, 211, 238, 0.85); transition: color 0.4s; }
+
+  .bottom { position: relative; grid-row: 2; display: flex; flex-direction: column; align-items: center; gap: 16px; padding-bottom: clamp(10px, 2vh, 26px); }
+  .wave { display: flex; align-items: center; gap: 3px; height: 40px; }
+  .wave i { width: 3px; height: 4px; background: var(--cyan); box-shadow: 0 0 8px rgba(34, 211, 238, 0.6); border-radius: 2px; }
+  .pill { display: flex; align-items: center; gap: 14px; padding: 12px 26px; border: 1px solid var(--line-strong); border-radius: 999px; background: rgba(3, 18, 24, 0.75); color: var(--cyan-hi); letter-spacing: 0.32em; font-weight: 600; box-shadow: 0 0 24px rgba(34, 211, 238, 0.08), inset 0 0 18px rgba(34, 211, 238, 0.06); transition: box-shadow 0.4s, border-color 0.4s; }
+  .pill svg { width: 16px; height: 16px; color: var(--cyan); }
+  .pill.live { border-color: var(--cyan); box-shadow: 0 0 30px rgba(34, 211, 238, 0.28), inset 0 0 18px rgba(34, 211, 238, 0.12); }
+  .pill .dots::after { content: ""; animation: dots 1.4s steps(4) infinite; }
+  .hint { position: fixed; left: calc(var(--gap) * 1.2); bottom: 8px; font-size: 0.72em; letter-spacing: 0.2em; color: var(--text-faint); z-index: 2; }
+
+  @keyframes panelIn { from { opacity: 0; transform: translateY(14px); filter: blur(4px); } to { opacity: 1; transform: none; filter: none; } }
+  @keyframes fadeDown { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
+  @keyframes fadeIn { to { opacity: 1; } }
+  @keyframes logIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  @keyframes logoSpin { to { transform: rotate(405deg); } }
+  @keyframes logoPulse { 0%, 100% { opacity: 0.9; } 50% { opacity: 0.35; } }
+  @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <div class="logo"><i></i><i></i></div>
+      <div><h1>JARVIS</h1><small>JUST A RATHER VERY INTELLIGENT SYSTEM</small></div>
+    </div>
+    <div class="hstats">
+      <div class="hstat"><span>SYSTEM STATUS</span><b><i class="dot"></i><span id="hStatus" style="color:inherit;font-size:inherit;letter-spacing:inherit">BOOTING</span></b></div>
+      <div class="hstat"><span>LOCAL TIME</span><b id="hTime">--:--:--</b></div>
+      <div class="hstat"><span>SESSION</span><b id="hUptime">00:00</b></div>
+    </div>
+    <div class="hright">
+      <button class="icon-btn" title="Notifications" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></button>
+      <button class="icon-btn" title="Settings" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+      <div class="chip">ROOT@JARVIS <span class="orb"></span></div>
+      <button class="icon-btn" id="exitBtn" title="Exit Jarvis (Esc twice)" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg></button>
+    </div>
+  </header>
+
+  <main>
+    <section class="col left">
+      <div class="panel">
+        <div class="pips"><i></i><i></i></div>
+        <div class="ph"><div><h2>SYSTEM //</h2><h3>AUDIO</h3></div><em id="audioTag">STANDBY</em></div>
+        <div class="track" id="track">—</div>
+        <div class="artist" id="artist">SPOTIFY LINK PENDING</div>
+        <div class="spectrum" id="spectrum"></div>
+        <div class="row"><span class="label">SPOTIFY VOLUME</span><span class="val" id="volVal">--%</span></div>
+        <div class="bar"><i id="volBar"></i></div>
+      </div>
+      <div class="panel">
+        <div class="pips"><i></i><i></i></div>
+        <div class="ph"><div><h2>SYSTEM //</h2><h3>RESOURCES</h3></div><em>RT-MONITOR</em></div>
+        <div class="row"><span class="label">CPU LOAD</span><span class="val" id="cpuVal">--%</span></div>
+        <div class="bar"><i id="cpuBar"></i></div>
+        <div class="kv" style="margin-top:16px">
+          <div><span class="label">MICROPHONE</span><span class="val" id="micVal">CLOSED</span></div>
+          <div><span class="label">SESSION</span><span class="val" id="sessVal">00:00</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="pips"><i></i><i></i></div>
+        <div class="ph"><div><h2>SYSTEM //</h2><h3>VOICE</h3></div><em id="voiceTag">ELEVENLABS</em></div>
+        <canvas class="scope" id="scope"></canvas>
+        <div class="row"><span class="label">VOICE OUTPUT</span><span class="val" id="voiceVal">STANDBY</span></div>
+        <div class="bar"><i id="voiceBar"></i></div>
+      </div>
+    </section>
+
+    <section class="stage">
+      <div class="frame"><i></i><i></i><i></i><i></i></div>
+      <canvas id="core"></canvas>
+      <div class="corelabel"><small>CORE</small><b id="coreState">STARTING</b></div>
+      <div class="bottom">
+        <div class="wave" id="wave"></div>
+        <div class="pill" id="pill">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4"/></svg>
+          <span id="prompt">INITIALIZING</span><span class="dots"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="col right">
+      <div class="panel">
+        <div class="pips"><i></i><i></i></div>
+        <div class="ph"><div><h2>SYSTEM //</h2><h3>STATUS</h3></div><em>MARK I</em></div>
+        <div class="meters">
+          <div><span class="label">CORE</span><span class="val" id="coreVal">BOOT</span><div class="bar"><i id="coreBar"></i></div></div>
+          <div><span class="label">LINK</span><span class="val">LOCAL</span><div class="bar"><i style="width:100%"></i></div></div>
+        </div>
+        <div class="tiles">
+          <div class="tile" id="tCore"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5z"/></svg><small>CORE</small></div>
+          <div class="tile" id="tAudio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><small>AUDIO</small></div>
+          <div class="tile" id="tVoice"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 12h2M8 8v8M12 5v14M16 8v8M20 12h0"/></svg><small>VOICE</small></div>
+          <div class="tile" id="tMic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4"/></svg><small>MIC</small></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="pips"><i></i><i></i></div>
+        <div class="ph"><div><h2>SYSTEM //</h2><h3>EVENT LOG</h3></div><em>RT-LOG</em></div>
+        <ul class="log" id="log"></ul>
+      </div>
+      <div class="panel">
+        <div class="pips"><i></i><i></i></div>
+        <div class="ph"><div><h2>SYSTEM //</h2><h3>TERMINAL</h3></div><em>ROOT@JARVIS</em></div>
+        <div class="term"><p id="termCmd">jarvis --boot<span class="caret"></span></p><small id="termOut">Initializing core systems…</small></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="hint">ESC ESC — EXIT</div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const t0 = performance.now();
+  const now = () => (performance.now() - t0) / 1000;
+
+  // ------------------------------------------------------------------ state
+  const STATES = {
+    STARTING:  { label: "STARTING",  status: "BOOTING",   spin: 0.55, glow: 0.45, speak: 0, think: 0, listen: 0, prompt: "INITIALIZING" },
+    ONLINE:    { label: "ONLINE",    status: "OPTIMAL",   spin: 1.0,  glow: 0.7,  speak: 0, think: 0, listen: 0, prompt: "SYSTEMS ONLINE" },
+    LISTENING: { label: "LISTENING", status: "LISTENING", spin: 0.8,  glow: 0.9,  speak: 0, think: 0, listen: 1, prompt: "LISTENING" },
+    THINKING:  { label: "THINKING",  status: "PROCESSING",spin: 2.4,  glow: 0.8,  speak: 0, think: 1, listen: 0, prompt: "PROCESSING" },
+    SPEAKING:  { label: "SPEAKING",  status: "SPEAKING",  spin: 1.25, glow: 1.0,  speak: 1, think: 0, listen: 0, prompt: "SPEAKING" },
+  };
+  const S = {
+    state: "STARTING", prompt: null,
+    level: 0, levelTarget: 0, lastLevelAt: -10,
+    boot: null,               // {start, dur}
+    volume: null, volFade: null, // {from, to, start, dur}
+    music: false, voice: "STANDBY",
+    p: { spin: 0.55, glow: 0.45, speak: 0, think: 0, listen: 0 },
+    reveal: 0,
+  };
+
+  function setState(name, prompt) {
+    if (!STATES[name]) return;
+    S.state = name;
+    S.prompt = prompt || null;
+    const d = STATES[name];
+    $("coreState").textContent = d.label;
+    $("hStatus").textContent = d.status;
+    $("prompt").textContent = S.prompt || d.prompt;
+    $("pill").classList.toggle("live", name !== "STARTING");
+    $("coreVal").textContent = name === "STARTING" ? "BOOT" : "ACTIVE";
+    $("tCore").classList.toggle("on", name !== "STARTING");
+    if (name === "SPEAKING") setVoice("SPEAKING");
+    else if (S.voice === "SPEAKING") setVoice("READY");
+    if (name === "LISTENING") $("micVal").textContent = "OPEN";
+    if (S.prompt === "AWAITING COMMAND") {
+      $("termCmd").innerHTML = 'jarvis --await<span class="caret"></span>';
+      $("termOut").textContent = "Awaiting command…";
+    } else if (name === "SPEAKING") {
+      $("termCmd").innerHTML = 'jarvis --speak welcome<span class="caret"></span>';
+      $("termOut").textContent = "Voice output in progress…";
+    }
+  }
+  function setVoice(v) {
+    S.voice = v;
+    $("voiceVal").textContent = v;
+    $("tVoice").classList.toggle("on", v === "READY" || v === "SPEAKING");
+  }
+
+  // ------------------------------------------------------------------ log
+  const logEl = $("log");
+  function addLog(text, hl) {
+    const d = new Date();
+    const li = document.createElement("li");
+    if (hl) li.className = "hl";
+    const tm = document.createElement("time");
+    tm.textContent = "[" + d.toTimeString().slice(0, 8) + "]";
+    const sp = document.createElement("span");
+    sp.textContent = String(text).toUpperCase();
+    li.append(tm, sp);
+    logEl.append(li);
+    while (logEl.children.length > 14) logEl.firstChild.remove();
+  }
+
+  // ------------------------------------------------------------------ messages from Jarvis
+  function receive(msg) {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.state) setState(msg.state, msg.prompt);
+    else if (msg.prompt) { S.prompt = msg.prompt; $("prompt").textContent = msg.prompt; }
+    if (typeof msg.level === "number") { S.levelTarget = clamp(msg.level, 0, 1); S.lastLevelAt = now(); }
+    if (msg.boot) S.boot = { start: now(), dur: Math.max(0.5, +msg.boot.seconds || 7) };
+    if (msg.music) {
+      S.music = true;
+      $("track").textContent = msg.music.track || "—";
+      $("artist").textContent = (msg.music.artist || "").toUpperCase();
+      $("audioTag").textContent = "NOW PLAYING";
+      $("tAudio").classList.add("on");
+      if (typeof msg.music.volume === "number") { S.volume = msg.music.volume; S.volFade = null; }
+    }
+    if (msg.volume_fade) {
+      const from = S.volume == null ? msg.volume_fade.to : S.volume;
+      S.volFade = { from, to: msg.volume_fade.to, start: now(), dur: Math.max(0.01, +msg.volume_fade.seconds || 0.01) };
+    }
+    if (msg.voice) setVoice(String(msg.voice).toUpperCase());
+    if (typeof msg.cpu === "number") { $("cpuVal").textContent = Math.round(msg.cpu * 100) + "%"; $("cpuBar").style.width = clamp(msg.cpu * 100, 0, 100) + "%"; }
+    if (msg.mic) { $("micVal").textContent = String(msg.mic).toUpperCase(); $("tMic").classList.toggle("on", String(msg.mic).toUpperCase() === "OPEN"); }
+    if (msg.log) addLog(msg.log, !!msg.highlight);
+    if (msg.terminal) { $("termCmd").innerHTML = ""; $("termCmd").append(document.createTextNode(msg.terminal.cmd || "")); const c = document.createElement("span"); c.className = "caret"; $("termCmd").append(c); $("termOut").textContent = msg.terminal.out || ""; }
+  }
+  window.jarvis = { receive, setState };
+
+  // ------------------------------------------------------------------ exit (Esc twice / power button)
+  let lastEsc = 0;
+  function quit() {
+    try { if (window.pywebview && window.pywebview.api) window.pywebview.api.quit(); } catch (e) {}
+  }
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { const t = now(); if (t - lastEsc < 1.0) quit(); lastEsc = t; }
+  });
+  $("exitBtn").addEventListener("click", quit);
+
+  // ------------------------------------------------------------------ static DOM bits
+  const spec = $("spectrum"); const specBars = [];
+  for (let i = 0; i < 28; i++) { const b = document.createElement("i"); spec.append(b); specBars.push(b); }
+  const wave = $("wave"); const waveBars = [];
+  for (let i = 0; i < 31; i++) { const b = document.createElement("i"); wave.append(b); waveBars.push(b); }
+
+  // ------------------------------------------------------------------ canvases
+  const core = $("core"), cx = core.getContext("2d");
+  const scope = $("scope"), sx = scope.getContext("2d");
+  function fit(c, ctx) {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const r = c.getBoundingClientRect();
+    c.width = Math.max(1, Math.round(r.width * dpr)); c.height = Math.max(1, Math.round(r.height * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { w: r.width, h: r.height };
+  }
+  let CS = fit(core, cx), SS = fit(scope, sx);
+  window.addEventListener("resize", () => { CS = fit(core, cx); SS = fit(scope, sx); });
+
+  // particles
+  const parts = Array.from({ length: 70 }, (_, i) => ({ a: Math.random() * Math.PI * 2, r: 0.42 + Math.random() * 0.5, s: (0.04 + Math.random() * 0.12) * (Math.random() < 0.5 ? -1 : 1), z: Math.random() }));
+  const noise = (i, t) => 0.5 + 0.5 * Math.sin(i * 12.9898 + t * 7.1) * Math.cos(i * 4.1414 + t * 3.3);
+
+  const CY = "34,211,238", HI = "139,243,255";
+  function ring(r, a, w, dash) {
+    cx.beginPath(); cx.arc(0, 0, r, 0, Math.PI * 2);
+    cx.lineWidth = w; cx.strokeStyle = `rgba(${CY},${a})`;
+    cx.setLineDash(dash || []); cx.stroke(); cx.setLineDash([]);
+  }
+  function arc(r, a0, a1, a, w, col) {
+    cx.beginPath(); cx.arc(0, 0, r, a0, a1);
+    cx.lineWidth = w; cx.strokeStyle = `rgba(${col || HI},${a})`; cx.stroke();
+  }
+
+  let last = now(), rot = 0;
+  function frame() {
+    const t = now(); const dt = Math.min(0.05, t - last); last = t;
+    // smooth state params
+    const tgt = STATES[S.state];
+    for (const k of ["spin", "glow", "speak", "think", "listen"]) S.p[k] = lerp(S.p[k], tgt[k], 1 - Math.exp(-dt * 3.2));
+    S.reveal = clamp(t / 1.8, 0, 1);
+    // voice level: decay if no updates; synthesize gently while SPEAKING without data
+    if (t - S.lastLevelAt > 0.25) S.levelTarget = S.state === "SPEAKING" ? 0.35 + 0.3 * noise(3, t * 1.7) : 0;
+    S.level = lerp(S.level, S.levelTarget, 1 - Math.exp(-dt * 14));
+    const L = S.level * S.p.speak;
+    rot += dt * S.p.spin;
+
+    // spotify volume animation
+    if (S.volFade) {
+      const k = clamp((t - S.volFade.start) / S.volFade.dur, 0, 1);
+      const e = k * k * (3 - 2 * k);
+      S.volume = lerp(S.volFade.from, S.volFade.to, e);
+      if (k >= 1) S.volFade = null;
+    }
+    if (S.volume != null) { $("volVal").textContent = Math.round(S.volume) + "%"; $("volBar").style.width = clamp(S.volume, 0, 100) + "%"; }
+
+    // ---------- core
+    const { w, h } = CS;
+    cx.clearRect(0, 0, w, h);
+    const R = Math.min(w, h * 0.86) * 0.36 * (0.92 + 0.08 * S.reveal);
+    cx.save(); cx.translate(w / 2, h * 0.44);
+    const rv = S.reveal, g = S.p.glow;
+
+    // ambient glow
+    const gr = cx.createRadialGradient(0, 0, R * 0.1, 0, 0, R * 1.35);
+    gr.addColorStop(0, `rgba(${CY},${0.10 * g + 0.10 * L})`); gr.addColorStop(0.45, `rgba(${CY},${0.035 * g})`); gr.addColorStop(1, "rgba(0,0,0,0)");
+    cx.fillStyle = gr; cx.beginPath(); cx.arc(0, 0, R * 1.35, 0, Math.PI * 2); cx.fill();
+
+    // outer dashed ring (slow, counter-clockwise)
+    cx.save(); cx.rotate(-rot * 0.06);
+    ring(R * 1.0, 0.45 * rv, 1.6, [7, 9]);
+    cx.restore();
+
+    // ring with bright travelling segments
+    cx.save(); cx.rotate(rot * 0.32);
+    ring(R * 0.93, 0.22 * rv, 1);
+    cx.shadowColor = `rgba(${CY},0.9)`; cx.shadowBlur = 14;
+    arc(R * 0.93, -0.06, 0.06, 0.95 * rv, 5); arc(R * 0.93, Math.PI - 0.06, Math.PI + 0.06, 0.95 * rv, 5);
+    cx.shadowBlur = 0;
+    cx.restore();
+
+    // tick ring
+    cx.save(); cx.rotate(rot * 0.08);
+    for (let i = 0; i < 180; i++) {
+      const a = (i / 180) * Math.PI * 2; const long = i % 15 === 0;
+      const r0 = R * 0.855, r1 = R * (long ? 0.815 : 0.84);
+      cx.beginPath(); cx.moveTo(Math.cos(a) * r0, Math.sin(a) * r0); cx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+      cx.strokeStyle = `rgba(${CY},${(long ? 0.55 : 0.18) * rv})`; cx.lineWidth = long ? 1.4 : 1; cx.stroke();
+    }
+    cx.restore();
+
+    // boot progress (STARTING)
+    if (S.boot) {
+      const k = clamp((t - S.boot.start) / S.boot.dur, 0, 1);
+      const fade = S.state === "STARTING" ? 1 : clamp(1 - (t - S.boot.start - S.boot.dur) / 1.2, 0, 1);
+      if (fade > 0) {
+        cx.shadowColor = `rgba(${CY},0.9)`; cx.shadowBlur = 10;
+        arc(R * 0.79, -Math.PI / 2, -Math.PI / 2 + k * Math.PI * 2, 0.85 * fade, 2.2);
+        cx.shadowBlur = 0;
+        cx.fillStyle = `rgba(${HI},${0.7 * fade})`; cx.font = `600 ${Math.max(10, R * 0.045)}px ui-monospace, Menlo, monospace`;
+        cx.textAlign = "center"; cx.fillText(Math.round(k * 100) + "%", 0, -R * 0.69);
+        $("coreBar").style.width = Math.round(k * 100) + "%";
+      }
+    }
+
+    // scanner sweep
+    if (cx.createConicGradient) {
+      const a = rot * 0.9;
+      const cg = cx.createConicGradient(a, 0, 0);
+      cg.addColorStop(0, `rgba(${CY},${0.16 * g * rv})`); cg.addColorStop(0.12, `rgba(${CY},0)`); cg.addColorStop(1, `rgba(${CY},0)`);
+      cx.fillStyle = cg; cx.beginPath(); cx.arc(0, 0, R * 0.74, 0, Math.PI * 2); cx.fill();
+    }
+
+    // middle ring + spokes
+    ring(R * 0.74, 0.5 * rv, 1.2);
+    cx.save(); cx.rotate(rot * 0.04 + 0.5);
+    for (let i = 0; i < 3; i++) {
+      const a = (i / 3) * Math.PI * 2;
+      cx.beginPath(); cx.moveTo(Math.cos(a) * R * 0.33, Math.sin(a) * R * 0.33); cx.lineTo(Math.cos(a) * R * 0.95, Math.sin(a) * R * 0.95);
+      cx.moveTo(-Math.cos(a) * R * 0.33, -Math.sin(a) * R * 0.33); cx.lineTo(-Math.cos(a) * R * 0.95, -Math.sin(a) * R * 0.95);
+      cx.strokeStyle = `rgba(${CY},${0.16 * rv})`; cx.lineWidth = 1; cx.stroke();
+    }
+    cx.restore();
+
+    // thinking: chasing arcs
+    if (S.p.think > 0.01) {
+      cx.save(); cx.rotate(t * 3.2);
+      for (let i = 0; i < 3; i++) arc(R * 0.6, i * 2.094, i * 2.094 + 0.7, 0.75 * S.p.think, 3);
+      cx.restore();
+      cx.save(); cx.rotate(-t * 2.1);
+      for (let i = 0; i < 6; i++) arc(R * 0.55, i * 1.047, i * 1.047 + 0.25, 0.35 * S.p.think, 1.5, CY);
+      cx.restore();
+    }
+
+    // listening: ripples
+    if (S.p.listen > 0.01) {
+      for (let i = 0; i < 3; i++) {
+        const k = ((t * 0.6 + i / 3) % 1);
+        ring(R * (0.34 + k * 0.4), (1 - k) * 0.45 * S.p.listen, 1.5);
+      }
+    }
+
+    // speaking: radial equalizer around the core
+    if (S.p.speak > 0.01) {
+      const n = 96;
+      cx.save(); cx.rotate(rot * 0.15);
+      cx.shadowColor = `rgba(${CY},0.8)`; cx.shadowBlur = 8;
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2;
+        const v = (0.15 + 0.85 * noise(i, t * 2.2)) * (0.25 + L * 1.1);
+        const r0 = R * 0.37, r1 = r0 + R * 0.2 * v * S.p.speak;
+        cx.beginPath(); cx.moveTo(Math.cos(a) * r0, Math.sin(a) * r0); cx.lineTo(Math.cos(a) * r1, Math.sin(a) * r1);
+        cx.strokeStyle = `rgba(${HI},${(0.25 + 0.6 * v) * S.p.speak})`; cx.lineWidth = 2; cx.stroke();
+      }
+      cx.shadowBlur = 0; cx.restore();
+    }
+
+    // orbiting particles
+    for (const p of parts) {
+      p.a += p.s * dt * (0.6 + S.p.spin * 0.6);
+      const r = R * p.r;
+      const x = Math.cos(p.a) * r, y = Math.sin(p.a) * r;
+      cx.fillStyle = `rgba(${HI},${(0.15 + 0.5 * p.z) * rv * (0.6 + 0.4 * g)})`;
+      cx.fillRect(x, y, 1.3, 1.3);
+    }
+
+    // inner core
+    const breathe = 0.5 + 0.5 * Math.sin(t * (S.state === "LISTENING" ? 3 : 1.6));
+    const rc = R * (0.3 + 0.012 * breathe + 0.05 * L);
+    const ig = cx.createRadialGradient(0, 0, 0, 0, 0, rc);
+    ig.addColorStop(0, `rgba(${CY},${0.10 + 0.25 * L})`); ig.addColorStop(0.8, `rgba(${CY},${0.04 + 0.06 * g})`); ig.addColorStop(1, `rgba(${CY},0.0)`);
+    cx.fillStyle = ig; cx.beginPath(); cx.arc(0, 0, rc, 0, Math.PI * 2); cx.fill();
+    cx.shadowColor = `rgba(${CY},1)`; cx.shadowBlur = 18 + 30 * L + 8 * g;
+    ring(rc, (0.7 + 0.3 * breathe) * rv, 2.2 + 2 * L);
+    cx.shadowBlur = 0;
+    ring(R * 0.335, 0.25 * rv, 1);
+
+    // 3x3 grid of cells in the middle of the core
+    const cs = R * 0.045, gap = R * 0.03, offs = cs + gap;
+    for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+      const k = (i + 1) * 3 + (j + 1);
+      let a = 0.35;
+      if (S.p.think > 0.3) a = 0.25 + 0.75 * ((Math.floor(t * 8) % 9) === k ? 1 : 0.15);
+      if (i === 0 && j === 0) a = 0.55 + 0.45 * breathe + 0.5 * L;
+      const x = j * offs - cs / 2, y = i * offs - cs / 2 + R * 0.16;
+      if (i === 0 && j === 0) { cx.fillStyle = `rgba(${HI},${clamp(a, 0, 1) * rv})`; cx.fillRect(x, y, cs, cs); }
+      else { cx.strokeStyle = `rgba(${CY},${a * rv})`; cx.lineWidth = 1.2; cx.strokeRect(x, y, cs, cs); }
+    }
+    cx.restore();
+
+    // ---------- bottom waveform
+    const active = S.state !== "STARTING";
+    for (let i = 0; i < waveBars.length; i++) {
+      const mid = 1 - Math.abs(i - 15) / 16;
+      let v = active ? 0.08 + 0.12 * noise(i, t * 0.8) * mid : 0.05;
+      if (S.p.speak > 0.05) v += L * (0.35 + 0.65 * noise(i + 40, t * 3)) * mid * 1.4;
+      if (S.p.listen > 0.05) v += 0.25 * S.p.listen * noise(i + 9, t * 2) * mid;
+      if (S.p.think > 0.05) v += 0.2 * S.p.think * (0.5 + 0.5 * Math.sin(t * 6 - i * 0.5)) * mid;
+      waveBars[i].style.height = (4 + clamp(v, 0, 1) * 36) + "px";
+      waveBars[i].style.opacity = 0.35 + clamp(v, 0, 1) * 0.65;
+    }
+
+    // ---------- audio spectrum (follows Spotify volume)
+    const vol = S.volume == null ? 0 : S.volume / 100;
+    for (let i = 0; i < specBars.length; i++) {
+      const v = S.music ? (0.15 + 0.85 * noise(i + 100, t * 2.4)) * (0.25 + 0.75 * vol) : 0.05;
+      specBars[i].style.height = (6 + v * 92) + "%";
+    }
+
+    // ---------- voice scope
+    {
+      const { w: sw, h: sh } = SS;
+      sx.clearRect(0, 0, sw, sh);
+      sx.strokeStyle = `rgba(${CY},0.12)`; sx.lineWidth = 1;
+      sx.beginPath(); sx.moveTo(0, sh / 2); sx.lineTo(sw, sh / 2); sx.stroke();
+      sx.beginPath();
+      const amp = (sh * 0.42) * (0.04 + L * 0.96);
+      for (let x = 0; x <= sw; x += 2) {
+        const k = x / sw;
+        const env = Math.sin(Math.PI * k);
+        const y = sh / 2 + Math.sin(k * 38 + t * 9) * Math.sin(k * 7 - t * 3) * amp * env + Math.sin(k * 90 + t * 20) * amp * 0.15 * env;
+        x === 0 ? sx.moveTo(x, y) : sx.lineTo(x, y);
+      }
+      sx.strokeStyle = `rgba(${HI},0.9)`; sx.shadowColor = `rgba(${CY},0.9)`; sx.shadowBlur = 8; sx.lineWidth = 1.4; sx.stroke(); sx.shadowBlur = 0;
+      $("voiceBar").style.width = Math.round(L * 100) + "%";
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ------------------------------------------------------------------ clock / session
+  function tick() {
+    const d = new Date();
+    $("hTime").textContent = d.toTimeString().slice(0, 8);
+    const s = Math.floor(now()); const mm = String(Math.floor(s / 60)).padStart(2, "0"); const ss = String(s % 60).padStart(2, "0");
+    $("hUptime").textContent = mm + ":" + ss; $("sessVal").textContent = mm + ":" + ss;
+  }
+  tick(); setInterval(tick, 500);
+
+  setState("STARTING");
+  addLog("Jarvis interface online", true);
+})();
+</script>
+</body>
+</html>

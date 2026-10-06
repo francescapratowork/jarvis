@@ -2,18 +2,21 @@
 
 A Python script that listens to your Mac's microphone. When you **clap twice**, it:
 
-1. starts your song in the **Spotify** app at full volume, so you clearly hear it begin (and tells you in Terminal whether it worked),
-2. after the song has played for 10 s, smoothly **ducks** the music to 35% — still audible — and speaks a welcome line in your **ElevenLabs** voice over it,
-3. when the voice finishes, **fades the music back up** over ~2 s (Spotify's own volume only — your Mac's volume and other sounds are untouched),
-4. meanwhile opens **Claude** and **Tasaradar** in new **Google Chrome** windows (fullscreen, one per display if you have several) and brings **Cursor** to the front (fullscreen).
+1. immediately opens the animated, full-screen **Jarvis interface** (and keeps it in front for the whole session),
+2. starts your song in the **Spotify** app in the background — Spotify's window never appears — at full volume,
+3. after the song has played for 7 s (while the interface boots), smoothly **ducks** the music to 35% — still audible — and speaks a welcome line in your **ElevenLabs** voice over it, while the interface shows **SPEAKING** and reacts to the voice,
+4. when the voice finishes, **fades the music back up** over ~2 s (Spotify's own volume only — your Mac's volume and other sounds are untouched),
+5. shows **AWAITING COMMAND** and stays open until you close it.
 
-**How it behaves:** start Jarvis → it measures your room for 1.5 s → waits for **one** valid double clap → **turns the microphone off** → runs the welcome once → stops. Nothing you say or type afterwards can trigger it again. To use it again, run `./start_jarvis.sh` again.
+Jarvis no longer opens any other apps or websites (Claude, Chrome, Cursor, Tasaradar) by itself.
+
+**How it behaves:** start Jarvis → it measures your room for 1.5 s → waits for **one** valid double clap → **turns the microphone off** → runs the welcome once → keeps the interface open until you close it. Nothing you say or type afterwards can trigger it again. To use it again, run `./start_jarvis.sh` again.
 
 ## Requirements
 
 - A Mac running macOS 12 (Monterey) or newer.
 - **Python 3** from https://www.python.org/downloads/macos/ (3.10 or newer recommended).
-- **Spotify**, **Google Chrome** and **Cursor** installed in your Applications folder. Any of them can be missing: Jarvis skips Cursor, and opens Spotify/Chrome links in your default browser instead.
+- **Spotify** installed in your Applications folder (without it, the song opens in Spotify's web player instead, with no ducking).
 - An **ElevenLabs** account (API key + voice ID) for the spoken welcome. Without it, everything else still works.
 
 ## Install (first time)
@@ -48,21 +51,13 @@ open -e ~/jarvis/.env
 | `JARVIS_WELCOME_ENABLED` | `false` turns the voice off. | `true` |
 | `JARVIS_AFTER_SONG_DELAY_S` | Seconds between the music starting and the voice starting — only for YouTube/web links, which can't be ducked. | `0.5` |
 | `JARVIS_SONG_URI` | Spotify link (`https://open.spotify.com/track/…` or `spotify:track:…`) or a YouTube link. | the original track |
-| `JARVIS_MUSIC_LEAD_IN_SECONDS` | How long the song plays at full volume before ducking (the voice waits until then). | `10` |
+| `JARVIS_UI_ENABLED` | `false` = no full-screen interface (audio only, as before). | `true` |
+| `JARVIS_MUSIC_LEAD_IN_SECONDS` | How long the song plays at full volume before ducking (the voice waits until then). | `7` |
 | `JARVIS_SPOTIFY_DUCK_VOLUME` | Spotify's volume (0–100) while the voice speaks. | `35` |
 | `JARVIS_SPOTIFY_DUCK_FADE_SECONDS` | How long the duck (full → duck volume) takes; the voice starts when it's done. | `0.5` |
 | `JARVIS_SPOTIFY_NORMAL_VOLUME` | The song's full volume, at the start and after the voice (used when your previous Spotify volume is unknown or lower than the duck volume, or always if `JARVIS_SPOTIFY_RESTORE_PREVIOUS=false`). | `65` |
 | `JARVIS_SPOTIFY_RESTORE_PREVIOUS` | `true` = full volume is the volume Spotify had before Jarvis started; `false` = always `JARVIS_SPOTIFY_NORMAL_VOLUME`. | `true` |
 | `JARVIS_SPOTIFY_FADE_SECONDS` | How long the rise back to full volume after the voice takes. | `2.0` |
-| `CLAUDE_CODE_URL` | First Chrome window. | `https://claude.ai/new` |
-| `TASARADAR_URL` | Second Chrome window. `BINANCE_BTC_URL` from older setups is still read if this is empty. | `https://tasaradar.com` |
-| `OPEN_CLAUDE_CODE_IN_CHROME` / `OPEN_TASARADAR_IN_CHROME` | `false` skips that window. | `true` |
-| `CLAUDE_CHROME_MONITOR` / `TASARADAR_CHROME_MONITOR` | Display number (1 = leftmost). If you have fewer displays, the last one is used. | `1` / `3` |
-| `OPEN_CHROME_FULLSCREEN` | `true` = macOS fullscreen, `false` = normal window. | `true` |
-| `CHROME_WINDOW_WIDTH` / `CHROME_WINDOW_HEIGHT` | Window size when not fullscreen. | `1400` / `900` |
-| `CHROME_SEPARATE_SITE_PROFILES` | `true` = each site opens in its own temporary Chrome profile (no logins). | `false` |
-| `CURSOR_OPEN_FULLSCREEN` | `true` puts Cursor in fullscreen. | `true` |
-| `FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP` / `OPEN_NEW_CURSOR_ON_DOUBLE_CLAP` | Bring Cursor forward / also open a new Cursor window. | `true` / `false` |
 | `JARVIS_INPUT_DEVICE` | Force a microphone by name (e.g. `MacBook Pro Microphone`) or number. | your default mic |
 | `JARVIS_MIN_CLAP_PEAK` | The quietest peak a clap may have, however quiet the room. | `0.15` |
 | `JARVIS_MIN_CLAP_RMS` | The least energy (`rms`) a clap may have. This is what separates claps from clicks, taps and keys. Raise (e.g. `0.5`) if other sounds still trigger it; lower (e.g. `0.15`) if your claps show `too little energy`. | `0.3` |
@@ -90,7 +85,7 @@ cd ~/jarvis
 Every time Jarvis starts, its first lines show which version is running and from which folder, e.g.:
 
 ```
-Jarvis version 2026-10-05.6 (Spotify AppleScript fix, updater) — running /Users/you/jarvis/jarvis.py
+Jarvis version 2026-10-06.11 (full-screen interface, 7 s lead-in, no auto-opened apps) — running /Users/you/jarvis/jarvis.py
 Settings file: /Users/you/jarvis/.env (found)
 ```
 
@@ -117,10 +112,31 @@ Welcome voice: finished.
 Spotify: fading music up 35% → 70% over 2.0s (your previous Spotify volume)...
 …
 Spotify: restored to 70%.
-Welcome sequence finished. Jarvis has stopped. Run ./start_jarvis.sh to use it again.
+Jarvis interface is open and awaiting commands. Close it with Esc twice, the power button or Cmd+Q (or press Ctrl+C here).
 ```
 
 Stop it at any time with **Ctrl+C**.
+
+## The Jarvis interface
+
+After the double clap, Jarvis opens a full-screen, animated interface (it runs locally, no internet needed) and keeps it in front:
+
+- **STARTING** — boot animation with a countdown ring while the song plays at full volume.
+- **ONLINE** — the core idles with slow rotating rings.
+- **SPEAKING** — the core pulses and a ring of bars reacts to the voice in real time.
+- **LISTENING** / **THINKING** — ready for the upcoming voice commands.
+- **AWAITING COMMAND** — shown at the end; the interface stays open.
+
+The panels show real information: the song playing on Spotify and its volume (including the duck and fade), CPU load, microphone state, voice output and a live event log.
+
+**To exit:** press **Esc twice**, click the **power button** (top right), press **Cmd+Q**, or press **Ctrl+C** in Terminal.
+
+**Preview it without clapping** (no microphone, music or voice — it cycles through all the states):
+
+```bash
+cd ~/jarvis
+./start_jarvis.sh --ui-demo
+```
 
 ## Test your claps (nothing opens)
 
@@ -153,10 +169,9 @@ macOS asks for permission the first time Jarvis does each thing. Click **Allow**
 | Prompt | Why |
 | ------ | --- |
 | "Terminal" would like to access the microphone | Hearing your claps. |
-| "Terminal" wants access to control "Spotify" / "Google Chrome" / "System Events" | Playing the song, opening windows. |
-| Accessibility access | Putting Chrome and Cursor into fullscreen. Open **System Settings → Privacy & Security → Accessibility** and switch on **Terminal**. |
+| "Terminal" wants access to control "Spotify" | Playing the song and controlling its volume in the background. |
 
-If you click "Don't Allow" by mistake, turn it back on in **System Settings → Privacy & Security** under **Microphone**, **Automation** or **Accessibility**, then quit Terminal (Cmd+Q) and start again. Without Accessibility access, everything still opens, but windows only fill the screen instead of going fullscreen.
+The full-screen interface needs no extra permission. If you click "Don't Allow" by mistake, turn it back on in **System Settings → Privacy & Security** under **Microphone** or **Automation**, then quit Terminal (Cmd+Q) and start again.
 
 ## Tuning
 
@@ -179,7 +194,8 @@ Advanced shape checks (`CLAP_RMS_RATIO`, `MIN_HF_RATIO`, `MAX_CLAP_LEN_S`, `QUIE
   - *did not start playing*: open Spotify, check you're logged in and the track plays when you click it, and that Spotify isn't playing on another device (the speaker icon at the bottom right).
   - *music too loud/quiet under the voice*: change `JARVIS_SPOTIFY_DUCK_VOLUME` (e.g. `25` or `45`); after the voice, `JARVIS_SPOTIFY_NORMAL_VOLUME`.
   - Also check your Mac isn't muted. Jarvis warns if it is.
-- **Windows don't go fullscreen:** Give Terminal Accessibility access (see above).
+- **The interface doesn't appear:** look for a `Jarvis interface:` line in Terminal. If it mentions `pywebview`, run `./start_jarvis.sh` again (it installs it). Try `./start_jarvis.sh --ui-demo` to test the interface on its own. Set `JARVIS_UI_ENABLED=false` to run without it.
+- **Spotify's window shows up:** Jarvis launches Spotify hidden and brings the interface back to the front; if Spotify was already open on another desktop, macOS may briefly switch to it. Quitting Spotify before clapping avoids this.
 - **No welcome speech:** Check `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`, and look for an `ElevenLabs TTS failed` line in Terminal. A `404 Not Found` whose address contains something other than your voice ID (e.g. `/v1/text-to-speech/open%20-e%20...`) means the `ELEVENLABS_VOICE_ID=` line holds the wrong text: put only the voice ID after the `=`.
 - **A fix doesn't seem to apply:** Check the `Jarvis version … running …` line at startup, then run `./update_jarvis.sh`.
 - **`zsh: permission denied: ./start_jarvis.sh`:** Run `chmod +x start_jarvis.sh` once.
