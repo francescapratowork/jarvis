@@ -74,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.13 (Phase 2A: voice conversation, memory, calendar read)"
+JARVIS_VERSION = "2026-10-06.14 (speech-to-text: verified TLS trust store)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 

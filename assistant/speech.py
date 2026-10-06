@@ -14,6 +14,7 @@ import asyncio
 import base64
 import logging
 import queue
+import ssl
 import threading
 import time
 from typing import Callable
@@ -76,6 +77,55 @@ class STTError(RuntimeError):
     pass
 
 
+# ---------------------------------------------------------------------- TLS trust
+def verified_tls_context() -> ssl.SSLContext:
+    """A fully verifying TLS context (certificate chain + hostname) with a trusted CA source.
+
+    Python from python.org on macOS ships its own OpenSSL with no root certificates until
+    its "Install Certificates" step is run, so `ssl.create_default_context()` — which the
+    `websockets` library (and therefore the ElevenLabs realtime client) uses by default —
+    can trust nothing and every wss:// connection fails with SSLCertVerificationError.
+    The other clients bring their own trust source (httpx: certifi; Anthropic: truststore),
+    so we do the same here: the macOS system trust store via `truststore`, or the Mozilla
+    CA bundle from `certifi`. Verification is never disabled.
+    """
+    try:
+        import truststore
+
+        ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:  # noqa: BLE001 — truststore missing/unsupported: use certifi
+        import certifi
+
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cafile=certifi.where())
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+_scribe_tls_installed = False
+
+
+def _use_verified_tls_for_scribe() -> None:
+    """The ElevenLabs SDK opens its realtime WebSocket without an `ssl=` argument; give
+    secure (wss://) connections our verified context. Idempotent."""
+    global _scribe_tls_installed
+    if _scribe_tls_installed:
+        return
+    import elevenlabs.realtime.scribe as scribe_module
+
+    original = scribe_module.websocket_connect
+    context = verified_tls_context()
+
+    def connect_with_verified_tls(uri, *args, **kwargs):
+        if str(uri).startswith("wss://") and kwargs.get("ssl") is None:
+            kwargs["ssl"] = context
+        return original(uri, *args, **kwargs)
+
+    scribe_module.websocket_connect = connect_with_verified_tls
+    _scribe_tls_installed = True
+
+
 STT_ERROR_HINTS = {
     "auth_error": "ElevenLabs refused speech-to-text for this API key. In ElevenLabs → Developers → "
     "API Keys, edit your key and set 'Speech to Text' to Access.",
@@ -116,8 +166,16 @@ class STTSession:
         }
         if self.language:
             options["language_code"] = self.language
+        _use_verified_tls_for_scribe()
         try:
             self.conn = await ScribeRealtime(api_key=self.api_key, base_url=self.base_url).connect(options)
+        except ssl.SSLCertVerificationError as e:
+            raise STTError(
+                "could not verify ElevenLabs' security certificate "
+                f"({(getattr(e, 'verify_message', '') or 'certificate verify failed').rstrip('.')}). "
+                "If this persists, run 'Install Certificates.command' in your Python folder "
+                "(Applications → Python 3.x) and restart Terminal."
+            ) from e
         except Exception as e:  # noqa: BLE001
             msg = str(e)
             if "401" in msg or "403" in msg:
