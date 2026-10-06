@@ -76,7 +76,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.9 (0.05 s music lead-in before ducking)"
+JARVIS_VERSION = "2026-10-06.10 (song plays 10 s at full volume before ducking)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -171,7 +171,7 @@ SPOTIFY_NORMAL_VOLUME = _volume(
     )
 )
 # Seconds the song plays at full volume before ducking (so its beginning is clearly heard).
-MUSIC_LEAD_IN_SECONDS = max(0.0, _env_float("JARVIS_MUSIC_LEAD_IN_SECONDS", 0.05))
+MUSIC_LEAD_IN_SECONDS = max(0.0, _env_float("JARVIS_MUSIC_LEAD_IN_SECONDS", 10.0))
 # Seconds for the duck (full → duck volume); the voice starts once it's done.
 SPOTIFY_DUCK_FADE_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_DUCK_FADE_SECONDS", 0.5))
 # Seconds for the rise back to full volume after the voice.
@@ -823,6 +823,11 @@ class SpotifyPlayback:
     def lead_in(self) -> None:
         """Let the song play at full volume so its beginning is clearly heard."""
         if MUSIC_LEAD_IN_SECONDS > 0:
+            log.info(
+                "Spotify: playing at %d%% for %.1fs before the voice...",
+                self.full_volume,
+                MUSIC_LEAD_IN_SECONDS,
+            )
             time.sleep(MUSIC_LEAD_IN_SECONDS)
 
     def duck(self) -> None:

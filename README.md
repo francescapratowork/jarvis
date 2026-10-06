@@ -3,7 +3,7 @@
 A Python script that listens to your Mac's microphone. When you **clap twice**, it:
 
 1. starts your song in the **Spotify** app at full volume, so you clearly hear it begin (and tells you in Terminal whether it worked),
-2. after ~0.05 s, smoothly **ducks** the music to 35% — still audible — and speaks a welcome line in your **ElevenLabs** voice over it,
+2. after the song has played for 10 s, smoothly **ducks** the music to 35% — still audible — and speaks a welcome line in your **ElevenLabs** voice over it,
 3. when the voice finishes, **fades the music back up** over ~2 s (Spotify's own volume only — your Mac's volume and other sounds are untouched),
 4. meanwhile opens **Claude** and **Tasaradar** in new **Google Chrome** windows (fullscreen, one per display if you have several) and brings **Cursor** to the front (fullscreen).
 
@@ -48,7 +48,7 @@ open -e ~/jarvis/.env
 | `JARVIS_WELCOME_ENABLED` | `false` turns the voice off. | `true` |
 | `JARVIS_AFTER_SONG_DELAY_S` | Seconds between the music starting and the voice starting — only for YouTube/web links, which can't be ducked. | `0.5` |
 | `JARVIS_SONG_URI` | Spotify link (`https://open.spotify.com/track/…` or `spotify:track:…`) or a YouTube link. | the original track |
-| `JARVIS_MUSIC_LEAD_IN_SECONDS` | How long the song plays at full volume before ducking. | `0.05` |
+| `JARVIS_MUSIC_LEAD_IN_SECONDS` | How long the song plays at full volume before ducking (the voice waits until then). | `10` |
 | `JARVIS_SPOTIFY_DUCK_VOLUME` | Spotify's volume (0–100) while the voice speaks. | `35` |
 | `JARVIS_SPOTIFY_DUCK_FADE_SECONDS` | How long the duck (full → duck volume) takes; the voice starts when it's done. | `0.5` |
 | `JARVIS_SPOTIFY_NORMAL_VOLUME` | The song's full volume, at the start and after the voice (used when your previous Spotify volume is unknown or lower than the duck volume, or always if `JARVIS_SPOTIFY_RESTORE_PREVIOUS=false`). | `65` |
