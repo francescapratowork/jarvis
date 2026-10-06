@@ -48,8 +48,8 @@ Actions (macOS):
     or set JARVIS_WELCOME_CACHE_ENABLED=false to force a fresh fetch.
   The welcome sequence runs only once per process: Spotify starts quietly (ducked, its own
     volume only), the voice speaks over it, then the music fades up while Chrome and Cursor open.
-  JARVIS_SPOTIFY_DUCK_VOLUME / _NORMAL_VOLUME / _RESTORE_PREVIOUS / _FADE_SECONDS /
-    _FADE_IN_SECONDS — audio ducking (see .env.example).
+  JARVIS_MUSIC_LEAD_IN_SECONDS / JARVIS_SPOTIFY_DUCK_VOLUME / _DUCK_FADE_SECONDS /
+    _NORMAL_VOLUME / _RESTORE_PREVIOUS / _FADE_SECONDS — audio ducking (see .env.example).
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.7 (audio ducking: music under the voice, smooth fade-up)"
+JARVIS_VERSION = "2026-10-06.8 (song starts at full volume, ducks to 35% under the voice)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -162,16 +162,20 @@ def _volume(v: int) -> int:
     return max(0, min(100, v))
 
 
-# Audio ducking (Spotify's own volume, not the Mac's): the music starts quietly under the
-# spoken welcome, then fades up once the voice has finished.
-SPOTIFY_DUCK_VOLUME = _volume(_env_int("JARVIS_SPOTIFY_DUCK_VOLUME", 18))
+# Audio ducking (Spotify's own volume, not the Mac's): the song starts at full volume,
+# after a short lead-in it ducks under the spoken welcome (still audible), then rises again.
+SPOTIFY_DUCK_VOLUME = _volume(_env_int("JARVIS_SPOTIFY_DUCK_VOLUME", 35))
 SPOTIFY_NORMAL_VOLUME = _volume(
     _env_int(
         "JARVIS_SPOTIFY_NORMAL_VOLUME", int(SPOTIFY_VOLUME) if SPOTIFY_VOLUME.isdigit() else 65
     )
 )
-SPOTIFY_FADE_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_FADE_SECONDS", 2.5))
-SPOTIFY_FADE_IN_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_FADE_IN_SECONDS", 1.0))
+# Seconds the song plays at full volume before ducking (so its beginning is clearly heard).
+MUSIC_LEAD_IN_SECONDS = max(0.0, _env_float("JARVIS_MUSIC_LEAD_IN_SECONDS", 0.3))
+# Seconds for the duck (full → duck volume); the voice starts once it's done.
+SPOTIFY_DUCK_FADE_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_DUCK_FADE_SECONDS", 0.5))
+# Seconds for the rise back to full volume after the voice.
+SPOTIFY_FADE_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_FADE_SECONDS", 2.0))
 # True = fade back up to the volume Spotify had before Jarvis started (if it was louder than
 # the duck level); False = always fade up to JARVIS_SPOTIFY_NORMAL_VOLUME.
 SPOTIFY_RESTORE_PREVIOUS = _env_bool("JARVIS_SPOTIFY_RESTORE_PREVIOUS", True)
@@ -202,7 +206,9 @@ JARVIS_WELCOME_ENABLED = _env_bool("JARVIS_WELCOME_ENABLED", True)
 JARVIS_WELCOME_PHRASE = _env_str(
     "JARVIS_WELCOME_PHRASE", "Welcome home, sir. All systems are online."
 )
-# Seconds between the music starting and the voice starting.
+# Seconds between the music starting and the voice starting, used only when the music can't
+# be ducked (YouTube/web player links). With the Spotify app the voice starts right after the
+# lead-in + duck.
 JARVIS_AFTER_SONG_DELAY_S = _env_float("JARVIS_AFTER_SONG_DELAY_S", 0.5)
 # Save ElevenLabs PCM as WAV under .cache/jarvis_welcome/; replay skips the API when the key matches.
 JARVIS_WELCOME_CACHE_ENABLED = _env_bool("JARVIS_WELCOME_CACHE_ENABLED", True)
@@ -797,52 +803,65 @@ end tell
 
 
 class SpotifyPlayback:
-    """Spotify is playing, ducked under the voice. restore() fades it back up."""
+    """Spotify playing at its full volume; duck() lowers it under the voice and restore()
+    brings it back up. Only Spotify's own volume is changed."""
 
     def __init__(self, previous_volume: int | None) -> None:
         self.previous_volume = previous_volume
-        self.fade_in: threading.Thread | None = None
+        self.full_volume, self.full_reason = self._full_volume()
+        # Never "duck" upwards if the full volume is already at or below the duck level.
+        self.duck_volume = min(SPOTIFY_DUCK_VOLUME, self.full_volume)
+        self.ducked = False
         self.restored = False
 
-    def target_volume(self) -> tuple[int, str]:
+    def _full_volume(self) -> tuple[int, str]:
         prev = self.previous_volume
         if SPOTIFY_RESTORE_PREVIOUS and prev is not None and prev > SPOTIFY_DUCK_VOLUME:
             return prev, "your previous Spotify volume"
         return SPOTIFY_NORMAL_VOLUME, "JARVIS_SPOTIFY_NORMAL_VOLUME"
 
-    def start_fade_in(self) -> None:
-        """Bring the music in from silence to the duck level, in the background."""
-        if SPOTIFY_FADE_IN_SECONDS <= 0:
+    def lead_in(self) -> None:
+        """Let the song play at full volume so its beginning is clearly heard."""
+        if MUSIC_LEAD_IN_SECONDS > 0:
+            time.sleep(MUSIC_LEAD_IN_SECONDS)
+
+    def duck(self) -> None:
+        """Fade the song down to the duck level. Returns when the duck is complete, i.e.
+        when the voice should start."""
+        if self.duck_volume >= self.full_volume:
+            log.info("Spotify: already at %d%%, no need to duck.", self.full_volume)
             return
-        self.fade_in = threading.Thread(
-            target=_spotify_fade,
-            args=(0, SPOTIFY_DUCK_VOLUME, SPOTIFY_FADE_IN_SECONDS),
-            daemon=True,
+        log.info(
+            "Spotify: ducking %d%% → %d%% over %.1fs for the voice...",
+            self.full_volume,
+            self.duck_volume,
+            SPOTIFY_DUCK_FADE_SECONDS,
         )
-        self.fade_in.start()
+        self.ducked = True
+        if _spotify_fade(self.full_volume, self.duck_volume, SPOTIFY_DUCK_FADE_SECONDS):
+            log.info("Spotify: ducked to %d%% (still audible under the voice).", self.duck_volume)
 
     def restore(self, *, fade: bool = True) -> None:
         if self.restored:
             return
         self.restored = True
-        if self.fade_in is not None:
-            self.fade_in.join(timeout=SPOTIFY_FADE_IN_SECONDS + 15)
-        target, why = self.target_volume()
+        if not self.ducked:
+            return  # still at full volume
         seconds = SPOTIFY_FADE_SECONDS if fade else 0.0
         log.info(
             "Spotify: fading music up %d%% → %d%% over %.1fs (%s)...",
-            SPOTIFY_DUCK_VOLUME,
-            target,
+            self.duck_volume,
+            self.full_volume,
             seconds,
-            why,
+            self.full_reason,
         )
-        if _spotify_fade(SPOTIFY_DUCK_VOLUME, target, seconds):
-            log.info("Spotify: restored to %d%%.", target)
+        if _spotify_fade(self.duck_volume, self.full_volume, seconds):
+            log.info("Spotify: restored to %d%%.", self.full_volume)
 
 
 def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
-    """Launch Spotify if needed and play `uri` ducked (quiet), logging a clear result.
-    Returns a SpotifyPlayback to fade the music back up later, or None on failure."""
+    """Launch Spotify if needed and play `uri` at full volume, logging a clear result.
+    Returns a SpotifyPlayback to duck/restore the music, or None on failure."""
     if not _spotify_running():
         log.info("Spotify: starting the app...")
         subprocess.run(["open", "-g", "-a", "Spotify"], check=False)
@@ -854,10 +873,13 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
             return None
         time.sleep(3)  # let it log in and load the player
     previous = _spotify_get_volume()
-    start_volume = 0 if SPOTIFY_FADE_IN_SECONDS > 0 else SPOTIFY_DUCK_VOLUME
+    playback = SpotifyPlayback(previous)
+    start_volume = playback.full_volume
     log.info(
-        "Spotify: asking it to play %s, starting quietly (Spotify volume was %s)...",
+        "Spotify: asking it to play %s at %d%% (%s; Spotify volume was %s)...",
         uri,
+        start_volume,
+        playback.full_reason,
         f"{previous}%" if previous is not None else "unknown",
     )
 
@@ -871,17 +893,9 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
 
     if status == "ok":
         name, artist = (fields + ["", ""])[:2]
-        log.info("Spotify: SUCCESS — playing \"%s\" by %s.", name, artist)
-        playback = SpotifyPlayback(previous)
-        if SPOTIFY_FADE_IN_SECONDS > 0:
-            log.info(
-                "Spotify: ducked — fading in to %d%% over %.1fs, under the voice.",
-                SPOTIFY_DUCK_VOLUME,
-                SPOTIFY_FADE_IN_SECONDS,
-            )
-            playback.start_fade_in()
-        else:
-            log.info("Spotify: ducked to %d%% under the voice.", SPOTIFY_DUCK_VOLUME)
+        log.info(
+            "Spotify: SUCCESS — playing \"%s\" by %s at %d%%.", name, artist, start_volume
+        )
         return playback
     if status == "error":
         num, msg = (fields + ["", ""])[:2]
@@ -911,7 +925,7 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
 def play_song(uri: str) -> SpotifyPlayback | None:
     """Start the configured song. On macOS with the Spotify app this waits until Spotify
     reports it is playing (or fails), so any permission prompt shows before Chrome opens,
-    and returns a SpotifyPlayback (music ducked) to fade up later. Other links (YouTube,
+    and returns a SpotifyPlayback to duck/restore it. Other links (YouTube,
     web player) just open and return None (no ducking possible)."""
     u = uri.strip()
     if not u:
@@ -1101,8 +1115,9 @@ def run_double_clap_actions() -> None:
     """The welcome sequence. Runs once, after the microphone is closed, and returns only
     when everything has finished:
 
-      music starts quietly (ducked) → the voice speaks over it → the voice finishes →
-      the music fades up smoothly while the workspace (Chrome, Cursor) opens.
+      song starts at full volume → after JARVIS_MUSIC_LEAD_IN_SECONDS it ducks (still
+      audible) → the voice speaks over it → the voice finishes → the song rises back
+      smoothly while the workspace (Chrome, Cursor) opens.
     """
     if IS_MAC:
         _check_mac_output_volume()
@@ -1121,9 +1136,15 @@ def run_double_clap_actions() -> None:
         music = play_song(SONG_URI)
 
         if prep is not None:
-            delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
-            if delay:
-                time.sleep(delay)
+            if music is not None:
+                music.lead_in()  # the song's beginning at full volume
+                voice_missing = not prep.is_alive() and prepared.get("audio") is None
+                if not voice_missing:
+                    music.duck()  # the voice starts as soon as the duck is done
+            else:
+                delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
+                if delay:
+                    time.sleep(delay)
             prep.join(timeout=30)
             audio = prepared.get("audio")
             if audio is not None:
@@ -1137,7 +1158,7 @@ def run_double_clap_actions() -> None:
             fade_up.start()
         open_workspace()
         if fade_up is not None:
-            fade_up.join(timeout=SPOTIFY_FADE_SECONDS + SPOTIFY_FADE_IN_SECONDS + 30)
+            fade_up.join(timeout=SPOTIFY_FADE_SECONDS + 30)
     finally:
         # Interrupted (Ctrl+C) or failed midway: never leave the music ducked.
         if music is not None and not music.restored:
