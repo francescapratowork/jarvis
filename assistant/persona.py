@@ -32,9 +32,11 @@ Tools
 - If a tool fails, say so in one sentence and suggest what she can do.
 
 Long-term memory
-- When she tells you something that is genuinely useful later (a goal, project, person and their role, commitment, preference, routine, business fact, decision, a follow-up she must do), save it with memory_remember, then just say "Annotato." (or "Noted.") together with your answer.
-- Do not save small talk, passing remarks, things you only inferred, or anything already in her calendar or reminders.
-- Deleting a memory requires her confirmation.
+- Each user message starts with a context note listing her CURRENT memory: goals, projects, decisions, hypotheses, preferences and key facts. Only items there (or returned by memory_recall without history) are current. Plan and prioritize from the CURRENT GOALS; anything labelled FUTURE is a later target, never today's priority; HYPOTHESES are ideas she is considering or testing, never present them as decided.
+- When she tells you something durable and useful later, save it with memory_remember, then just say "Annotato." (or "Noted.") together with your answer. Classify it precisely: fact, preference, goal, hypothesis (considering/testing), decision (only if she clearly says she has decided), project, person, commitment, routine, followup, kpi. Use slot_key for single-valued things so the new value replaces the old one.
+- Be conservative: do not save small talk, moods, passing remarks, jokes, things you only inferred, one-off details, or anything already in her calendar or reminders. When in doubt, don't save.
+- Changing an active goal or decision, or turning a hypothesis into a decision, needs her confirmation (the tool will say so). Replaced, archived and completed memories are history: use them only when she asks about the past (memory_recall with include_history) and never let them drive current priorities.
+- Archiving is preferred to deleting. Deleting a memory requires her confirmation.
 
 Actions that change things
 - Any tool that creates, changes or deletes something returns "needs_confirmation". Nothing has happened yet: read the action back in one short sentence and ask her to confirm. Only if her very next reply clearly says yes, call confirm_action with that action_id; otherwise call cancel_action. Never claim something was done before it was confirmed and executed.
@@ -49,13 +51,25 @@ Conversation flow
 """
 
 
-def context_note(now_text: str, profile: list[dict], user_name: str) -> str:
+def context_note(now_text: str, working_set, user_name: str) -> str:
+    """The per-turn context: current time and her CURRENT long-term memory, by section.
+    `working_set` is MemoryStore.working_set() (a list of (title, items)); a flat list of
+    memories (Phase 2A) is also accepted."""
     lines = [f"[Context — not spoken by {user_name}] Now: {now_text}."]
-    if profile:
-        lines.append("What you know about her (long-term memory, most important first):")
-        for m in profile:
+    if working_set and isinstance(working_set[0], dict):
+        working_set = [("WHAT YOU KNOW ABOUT HER", working_set)]
+    if not working_set:
+        lines.append("Long-term memory has no current items yet.")
+        return "\n".join(lines)
+    lines.append("Her CURRENT long-term memory (history, archived and replaced items are not shown):")
+    for title, items in working_set:
+        lines.append(f"{title}:")
+        for m in items:
             subject = f"{m['subject']}: " if m.get("subject") else ""
-            lines.append(f"- ({m['kind']}) {subject}{m['content']}")
-    else:
-        lines.append("Long-term memory is still empty.")
+            tags = [m["kind"]]
+            if m.get("domain") and m["domain"] != "general":
+                tags.append(m["domain"])
+            if m.get("status") and m["status"] != "active":
+                tags.append(m["status"].upper())
+            lines.append(f"- [#{m['id']} {' · '.join(tags)}] {subject}{m['content']}")
     return "\n".join(lines)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 from .activation import InterfaceActivation
 from .brain import Brain
@@ -95,6 +96,54 @@ def run_check_calendar() -> int:
     for line in lines:
         print(line)
     return 0 if ok else 1
+
+
+def _memory_store():
+    cfg = load_config()  # only JARVIS_DATA_DIR is used here; keys are never read out or printed
+    path = cfg.data_dir / "jarvis_memory.db"
+    store = MemoryStore(path)
+    if store.backup_path is not None:
+        print(f"Memory upgraded to v2 (backup of the previous database: {store.backup_path})")
+    return cfg, store
+
+
+def run_import_profile(args: list[str]) -> int:
+    """`./start_jarvis.sh --import-profile [file] [--apply]` (dry run unless --apply)."""
+    from .onboarding import OnboardingError, run
+
+    cfg, store = _memory_store()
+    files = [a for a in args if not a.startswith("--")]
+    path = Path(files[0]).expanduser() if files else cfg.data_dir / "onboarding.toml"
+    try:
+        lines = run(store, path, do_apply="--apply" in args)
+    except OnboardingError as e:
+        print(f"Memory onboarding: {e}")
+        return 1
+    print("\n".join(lines))
+    return 0
+
+
+def run_show_memory(args: list[str]) -> int:
+    """`./start_jarvis.sh --show-memory [--history]`: what Jarvis currently knows."""
+    from .persona import context_note
+
+    cfg, store = _memory_store()
+    counts = store.counts_by_status()
+    print(f"Memory database: {store.path} (schema v{store.schema_version()})")
+    print("Memories by status: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"))
+    print()
+    print("What Jarvis is given on every turn (the working set):")
+    print(context_note("(now)", store.working_set(), cfg.user_name))
+    if "--history" in args:
+        print()
+        print("History (superseded / archived / completed — never used for current priorities):")
+        rows = [m for m in store.recall("", limit=25, include_history=True) if m["status"] not in ("active", "future", "paused")]
+        for m in rows:
+            print(f"- [#{m['id']} {m['kind']} · {m['status'].upper()}" + (f" → #{m['superseded_by']}" if m.get("superseded_by") else "")
+                  + f"] {m['content']}")
+        if not rows:
+            print("- none")
+    return 0
 
 
 if __name__ == "__main__":

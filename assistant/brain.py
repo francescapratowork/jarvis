@@ -109,6 +109,7 @@ class Brain:
         self.system = system_prompt(cfg.user_name)
         self.messages: list[dict] = []
         self.turn = 0
+        self.last_user_text = ""
         self.user_turns_in_context = 0
 
     # ------------------------------------------------------------------ request
@@ -129,7 +130,7 @@ class Brain:
     def _user_message(self, transcript: str) -> dict:
         now = datetime.now().astimezone()
         now_text = now.strftime("%A %d %B %Y, %H:%M") + f" ({now.tzname()})"
-        note = context_note(now_text, self.memory.profile(), self.cfg.user_name)
+        note = context_note(now_text, self.memory.working_set(), self.cfg.user_name)
         return {"role": "user", "content": [{"type": "text", "text": note}, {"type": "text", "text": transcript}]}
 
     # ------------------------------------------------------------------ turn
@@ -140,6 +141,7 @@ class Brain:
             self.messages = []  # fresh short-term context; long-term memory is unaffected
             self.user_turns_in_context = 0
         self.user_turns_in_context += 1
+        self.last_user_text = transcript
         self.messages.append(self._user_message(transcript))
         self.memory.log_turn("user", transcript)
         ended = {"v": False}
@@ -204,7 +206,8 @@ class Brain:
     def _run_tool(self, name: str, args) -> dict:
         try:
             if name == "confirm_action":
-                return self.registry.confirm(str((args or {}).get("action_id", "")), self.ctx, self.turn)
+                return self.registry.confirm(str((args or {}).get("action_id", "")), self.ctx, self.turn,
+                                             user_text=self.last_user_text)
             if name == "cancel_action":
                 return self.registry.cancel(self.ctx)
             return self.registry.execute(name, args or {}, self.ctx, self.turn)

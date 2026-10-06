@@ -1,0 +1,45 @@
+# Jarvis memory onboarding — EXAMPLE FORMAT (no real data).
+#
+# Copy to data/onboarding.toml, fill in, then:
+#   ./start_jarvis.sh --import-profile            (dry run: shows ADD / UNCHANGED / UPDATE / SUPERSEDE)
+#   ./start_jarvis.sh --import-profile --apply    (writes it, after a backup)
+# Running it again never creates duplicates. Removing an item never deletes it:
+# set status = "archived" instead.
+#
+# Fields:
+#   id          stable, unique: lowercase letters, digits, - _ .   (never change it later)
+#   kind        fact | preference | goal | hypothesis | decision | project | person |
+#               commitment | routine | followup | kpi
+#               (hypothesis = being considered/tested, NOT decided)
+#   content     the information, one self-contained sentence
+#   domain      business | growth | equestrian | personal | general      (default general)
+#   status      active | future | paused | completed | archived          (default active)
+#   importance  1–5                                                      (default 3)
+#   subject     optional: who/what it is about
+#   slot_key    optional: single-valued key, e.g. business.revenue_target.current
+#   data        optional exact values, e.g. { amount = 10000, currency = "EUR", period = "month" }
+
+[[item]]
+id = "example-target-current"
+kind = "goal"
+domain = "business"
+status = "active"
+importance = 5
+slot_key = "business.revenue_target.current"
+content = "Example: reach €X/month from the main business."
+data = { amount = 0, currency = "EUR", period = "month" }
+
+[[item]]
+id = "example-icp"
+kind = "hypothesis"
+domain = "business"
+slot_key = "business.icp"
+importance = 4
+content = "Example: the ICP being tested is …"
+
+[[item]]
+id = "example-old-project"
+kind = "project"
+domain = "business"
+status = "archived"
+content = "Example: a previous business, no longer active."

@@ -175,7 +175,7 @@ After the welcome, Jarvis listens. Just speak — no commands to memorise:
 
 The interface shows what is really happening: **LISTENING** (the core reacts to your voice) → **THINKING** → **SPEAKING** → **LISTENING**. Your words and Jarvis's actions appear in the event log. After about **60 seconds of silence** Jarvis goes back to **AWAITING COMMAND** — press **Space** (or click the microphone button) to talk again. While you talk with Jarvis, Spotify plays more quietly (`JARVIS_CONVERSATION_MUSIC_VOLUME`).
 
-**What it can do in this version:** read your calendars and reminders (everything visible on this Mac), find free time, remember and recall important facts (stored only on your Mac in `data/`, never in the repository), forget a fact (only after you confirm), open apps when you ask. Creating or changing calendar events and reminders comes in the next phase — it will always ask for your confirmation first.
+**What it can do in this version:** read your calendars and reminders (everything visible on this Mac), find free time, remember and recall important information (see *Jarvis's memory* below), archive or forget it (forgetting only after you confirm), open apps when you ask. Creating or changing calendar events and reminders comes in the next phase — it will always ask for your confirmation first.
 
 **What it needs (one-time setup):**
 1. Calendar access — run `./start_jarvis.sh --check-calendar` and follow what it says.
@@ -185,6 +185,28 @@ The interface shows what is really happening: **LISTENING** (the core reacts to 
 Until the Anthropic key is added, Jarvis behaves exactly as before and stays on AWAITING COMMAND.
 
 **Test the brain by typing** (no microphone or voice): `./start_jarvis.sh --chat`
+
+### Jarvis's memory (Phase 2B · M1)
+
+Jarvis keeps a structured long-term memory on your Mac (`data/jarvis_memory.db`, never uploaded):
+
+- **Kinds:** *fact*, *preference*, *goal*, *hypothesis* (an idea you're considering or testing, never treated as decided), *decision*, *project*, *person*, *commitment*, *routine*, *follow-up*, *KPI*.
+- **Status:** *active*, *future*, *paused*, *completed*, *archived*, or *superseded* (replaced by something newer).
+- **Life area:** business, growth, equestrian, personal or general.
+- **What Jarvis sees on every turn:** only your **current** memory. That means active goals and projects first, then decisions, hypotheses (clearly marked *not decided*), preferences and key facts. **FUTURE** goals appear in their own labelled section and never compete with the current target. Archived and replaced memories are history: Jarvis uses them only when you ask about the past.
+- **Replacing information:** "My target is now €20K/month" replaces the €10K target. Because it changes an **active goal**, Jarvis asks you to confirm first. The same applies to changing a decision, turning a hypothesis into a decision, or reactivating something archived. Ordinary facts simply update ("Annotato."). The old value is kept as history.
+- **Confirmation needs a clear yes.** A reply like "sì / confermo / yes" confirms. Anything with a "no", "aspetta" or "non" does not.
+
+**See what Jarvis knows:** `./start_jarvis.sh --show-memory`. Add `--history` to also list replaced and archived items.
+
+**One-time profile import (onboarding):**
+1. Write your profile in `data/onboarding.toml`. The format is shown in `onboarding.example.toml`.
+2. Run `./start_jarvis.sh --import-profile`. This is a **dry run**: it shows each item as **ADD**, **UNCHANGED**, **UPDATE** or **SUPERSEDE/REPLACE**, plus any *possible overlaps* with memories saved in conversation. Nothing is written.
+3. If it looks right, run `./start_jarvis.sh --import-profile --apply`. Jarvis backs up the database first, in `data/backups/`.
+
+Running it again never creates duplicates. Removing an item from the file never deletes anything; set `status = "archived"` instead. The importer only reads that file, never `.env`.
+
+The first start of version `2026-10-06.16` upgrades the memory database in place. A backup is saved in `data/backups/` and every existing memory is kept.
 
 **Privacy:** what you say is transcribed by ElevenLabs and answered by Anthropic's Claude (including any calendar details needed for the answer). Memory and calendar access stay on your Mac. Keys are never printed or logged.
 
