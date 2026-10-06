@@ -13,6 +13,7 @@ Modules:
                 replacement (superseding) and the per-turn working set
   onboarding    one-time, repeatable profile import (dry run → --apply)
   calendar      macOS Calendar/Reminders access (via calendar_helper subprocess)
+  operations    confirmed calendar/reminder changes: routing, plans, action log, undo
   tools         tool registry: every capability is one tool, read or write
   brain         Claude conversation loop, confirmations, sentence streaming
   speech        microphone, realtime speech-to-text, streaming text-to-speech

@@ -74,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.16 (Phase 2B M1: memory v2, onboarding, working set)"
+JARVIS_VERSION = "2026-10-06.17 (Phase 2B M2: operational Calendar + Reminders)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -1787,6 +1787,10 @@ def main() -> int:
 
         args = sys.argv[sys.argv.index("--import-profile") + 1:]
         return run_import_profile(args)
+    if any(f in sys.argv[1:] for f in ("--calendars", "--set-calendar", "--set-reminder-list")):
+        from assistant.runtime import run_calendars
+
+        return run_calendars(sys.argv[1:])
     if "--show-memory" in sys.argv[1:]:
         from assistant.runtime import run_show_memory
 

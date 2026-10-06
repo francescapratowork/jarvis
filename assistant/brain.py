@@ -136,7 +136,7 @@ class Brain:
     # ------------------------------------------------------------------ turn
     def respond(self, transcript: str, on_sentence: Callable[[str], None]) -> TurnResult:
         self.turn += 1
-        self.registry.new_turn(self.turn)
+        self.registry.new_turn(self.turn, self.ctx)
         if self.user_turns_in_context >= MAX_USER_TURNS:
             self.messages = []  # fresh short-term context; long-term memory is unaffected
             self.user_turns_in_context = 0

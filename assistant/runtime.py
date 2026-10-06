@@ -11,6 +11,7 @@ from .brain import Brain
 from .calendar import CalendarService, check_calendar_report
 from .config import AssistantConfig, load_config
 from .memory import MemoryStore
+from .operations import AREAS, OpsStore, resolve_calendar, resolve_reminder_list
 from .tools import ToolContext, build_registry, open_mac_app
 
 log = logging.getLogger("jarvis.assistant")
@@ -23,6 +24,7 @@ def build_brain(cfg: AssistantConfig, on_log=lambda text: None, client=None) -> 
         calendar=CalendarService(cfg.calendar_backend),
         open_app=open_mac_app,
         log=on_log,
+        actions=OpsStore(memory),
     )
     return Brain(cfg, memory, build_registry(), ctx, client=client)
 
@@ -143,6 +145,71 @@ def run_show_memory(args: list[str]) -> int:
                   + f"] {m['content']}")
         if not rows:
             print("- none")
+    return 0
+
+
+def run_calendars(args: list[str]) -> int:
+    """`./start_jarvis.sh --calendars`: calendars and lists Jarvis can write into, and the
+    calendar set for each life area.
+    `./start_jarvis.sh --set-calendar <area> <calendar name>` (area: business, personal,
+    equestrian, growth, general) and `--set-reminder-list <area> <list name>`."""
+    from types import SimpleNamespace
+
+    from .calendar import CalendarError
+    from .operations import _label
+
+    cfg, store = _memory_store()
+    actions = OpsStore(store)
+    calendar = CalendarService(cfg.calendar_backend)
+    ctx = SimpleNamespace(calendar=calendar, actions=actions)
+    for flag, kind in (("--set-calendar", "calendar"), ("--set-reminder-list", "reminders")):
+        if flag in args:
+            rest = args[args.index(flag) + 1:]
+            if len(rest) < 2 or rest[0] not in AREAS:
+                print(f"Usage: ./start_jarvis.sh {flag} <{'|'.join(AREAS)}> <name>")
+                return 1
+            area, name = rest[0], " ".join(rest[1:])
+            try:
+                target = (resolve_reminder_list if kind == "reminders" else resolve_calendar)(ctx, area, name)
+            except CalendarError as e:
+                print(f"Calendar: {e}")
+                return 1
+            if "status" in target:
+                print(f"Not saved: {target.get('error', target['status'])}")
+                for key in ("choose_one_of", "writable_calendars", "reminder_lists"):
+                    if target.get(key):
+                        print("  Choose one of: " + "; ".join(target[key]))
+                return 1
+            actions.set_route(kind, area, target)
+            print(f"Saved: {area} → {_label(target)}")
+            return 0
+    try:
+        data = calendar.calendars()
+    except CalendarError as e:
+        print(f"Calendar: {e}")
+        return 1
+    print("Calendars Jarvis can write into:")
+    for c in data["calendars"]:
+        if c["writable"]:
+            print(f"  ✅ {_label(c)}" + ("   (default in the Calendar app)" if c.get("default") else ""))
+    print("Read-only calendars (Jarvis never writes into these):")
+    for c in data["calendars"]:
+        if not c["writable"]:
+            print(f"  🔒 {_label(c)}  [{c['type']}]")
+    print("Reminder lists:")
+    for c in data.get("reminder_lists", []):
+        print(f"  {'✅' if c['writable'] else '🔒'} {_label(c)}" + ("   (default in Reminders)" if c.get("default") else ""))
+    print()
+    routes, lists = actions.routes("calendar"), actions.routes("reminders")
+    print("Calendar for each life area:")
+    for area in AREAS:
+        r = routes.get(area)
+        fallback = "→ uses 'general'" if area != "general" else "→ Jarvis will ask"
+        print(f"  {area:<10} {_label(r) if r else 'not set ' + fallback}")
+    print("Reminder list for each life area:")
+    for area in AREAS:
+        r = lists.get(area)
+        print(f"  {area:<10} {_label(r) if r else 'not set → the default list in Reminders'}")
     return 0
 
 

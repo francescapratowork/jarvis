@@ -175,7 +175,7 @@ After the welcome, Jarvis listens. Just speak — no commands to memorise:
 
 The interface shows what is really happening: **LISTENING** (the core reacts to your voice) → **THINKING** → **SPEAKING** → **LISTENING**. Your words and Jarvis's actions appear in the event log. After about **60 seconds of silence** Jarvis goes back to **AWAITING COMMAND** — press **Space** (or click the microphone button) to talk again. While you talk with Jarvis, Spotify plays more quietly (`JARVIS_CONVERSATION_MUSIC_VOLUME`).
 
-**What it can do in this version:** read your calendars and reminders (everything visible on this Mac), find free time, remember and recall important information (see *Jarvis's memory* below), archive or forget it (forgetting only after you confirm), open apps when you ask. Creating or changing calendar events and reminders comes in the next phase — it will always ask for your confirmation first.
+**What it can do in this version:** read your calendars and reminders (everything visible on this Mac), find free time, remember and recall important information (see *Jarvis's memory* below), archive or forget it (forgetting only after you confirm), open apps when you ask. It can also create, move, change and delete calendar events and create, change and complete reminders. It always asks for your confirmation first (see below).
 
 **What it needs (one-time setup):**
 1. Calendar access — run `./start_jarvis.sh --check-calendar` and follow what it says.
@@ -185,6 +185,41 @@ The interface shows what is really happening: **LISTENING** (the core reacts to 
 Until the Anthropic key is added, Jarvis behaves exactly as before and stays on AWAITING COMMAND.
 
 **Test the brain by typing** (no microphone or voice): `./start_jarvis.sh --chat`
+
+### Calendar and reminders (Phase 2B · M2)
+
+You can just say things like:
+- "Aggiungimi equitazione domani dalle 8 alle 12."
+- "Domani bloccami tre ore per lavoro commerciale."
+- "Sposta la palestra alle 18."
+- "Cancella l'appuntamento di domani."
+- "Ricordami alle 17 di chiamare Marco."
+- "Ricordami venerdì di prenotare le unghie."
+- "Domani equitazione 8–12, poi tre ore di lavoro commerciale e un'ora di AI."
+
+**Calendar or reminder?** Something that takes time goes in the **calendar**. Something you just need to remember or do becomes a **reminder**; one with a time also alerts you. If it's unclear, Jarvis asks.
+
+**Nothing changes without your yes.**
+1. Jarvis reads the change back in one sentence, including any overlap with other events.
+2. It waits for a clear "sì / confermo / yes" in your very next reply.
+3. Only after that does it write to the calendar.
+4. It says "fatto" only after macOS confirms the change, and describes what was actually saved.
+
+For a day plan you approve all the blocks with one yes. "Annulla l'ultima cosa" reverses the last change; that also needs your yes.
+
+**Which calendar?** Jarvis never picks one at random.
+- Each life area (business, personal, equestrian, growth, general) can have its own calendar. Areas without one use *general*.
+- If nothing is set yet, Jarvis asks you which calendar to use and remembers your answer.
+- See your calendars and the current choices with `./start_jarvis.sh --calendars`.
+- You can also set them yourself, e.g. `./start_jarvis.sh --set-calendar equestrian Personale` or `./start_jarvis.sh --set-calendar general "Calendar (name@gmail.com)"`. Use the name exactly as `--calendars` shows it.
+- Reminders go to the default list of the Reminders app unless you set one with `--set-reminder-list <area> <list>`.
+- Subscribed, holiday, birthday and read-only shared calendars are never written to.
+
+**Repeating events:** Jarvis changes only the occurrence you mean, unless you say "and all the following ones".
+
+**Every change is recorded** in Jarvis's local database (`data/`): what was proposed, confirmed, done or failed.
+
+Writing needs the same **Full Access** to Calendars and Reminders that `./start_jarvis.sh --check-calendar` already set up. If that check shows "Direct access (EventKit): WORKING", nothing else is needed.
 
 ### Jarvis's memory (Phase 2B · M1)
 
