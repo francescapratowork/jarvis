@@ -1,7 +1,9 @@
-"""Calendar / Reminders client used by Jarvis's tools (read-only in Phase 2A).
+"""Calendar / Reminders client used by Jarvis's tools.
 
 All access goes through `assistant.calendar_helper` in a separate process (see there
-for why). JARVIS_CALENDAR_BACKEND = auto | eventkit | applescript.
+for why). JARVIS_CALENDAR_BACKEND = auto | eventkit | applescript (reading).
+Writing (Phase 2B · M2) always uses EventKit: it needs the same "Full Access" permission
+that reading with EventKit already uses. Every write returns what EventKit actually saved.
 """
 
 from __future__ import annotations
@@ -20,11 +22,12 @@ class CalendarError(RuntimeError):
     pass
 
 
-def _run_helper(*args: str, timeout: float = HELPER_TIMEOUT_S) -> dict:
+def _run_helper(*args: str, timeout: float = HELPER_TIMEOUT_S, payload: dict | None = None) -> dict:
     try:
         p = subprocess.run(
             [sys.executable, "-m", "assistant.calendar_helper", *args],
             cwd=str(ROOT),
+            input=json.dumps(payload) if payload is not None else None,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -79,6 +82,49 @@ class CalendarService:
 
     def reminders(self) -> list[dict]:
         return self._with_fallback("reminders").get("reminders", [])
+
+    # ------------------------------------------------------------------ EventKit (writes)
+    def _write(self, command: str, payload: dict) -> dict:
+        if self.backend() != "eventkit":
+            raise CalendarError(
+                "changing the calendar needs direct access (EventKit). Run ./start_jarvis.sh "
+                "--check-calendar and allow Full Access to Calendars and Reminders"
+            )
+        return _run_helper(command, payload=payload)
+
+    def calendars(self) -> dict:
+        """{"calendars": [...], "reminder_lists": [...]} with id, title, account, writable, default."""
+        if self.backend() != "eventkit":
+            raise CalendarError("listing calendars needs direct access (EventKit) — run ./start_jarvis.sh --check-calendar")
+        return _run_helper("calendars")
+
+    def get_event(self, event_id: str, occurrence_start: str = "") -> dict:
+        return self._write("event-get", {"id": event_id, "occurrence_start": occurrence_start})["event"]
+
+    def create_event(self, calendar_id: str, title: str, start: str, end: str, all_day: bool = False,
+                     location: str = "", notes: str = "") -> dict:
+        payload = {"calendar_id": calendar_id, "title": title, "start": start, "end": end, "all_day": all_day}
+        if location:
+            payload["location"] = location
+        if notes:
+            payload["notes"] = notes
+        return self._write("event-create", payload)["event"]
+
+    def update_event(self, event_id: str, occurrence_start: str, changes: dict, span: str = "this") -> dict:
+        return self._write("event-update", {"id": event_id, "occurrence_start": occurrence_start,
+                                            "changes": changes, "span": span})
+
+    def delete_event(self, event_id: str, occurrence_start: str = "", span: str = "this") -> dict:
+        return self._write("event-delete", {"id": event_id, "occurrence_start": occurrence_start, "span": span})
+
+    def create_reminder(self, list_id: str, title: str, due: str = "", notes: str = "") -> dict:
+        return self._write("reminder-create", {"list_id": list_id, "title": title, "due": due, "notes": notes})["reminder"]
+
+    def update_reminder(self, reminder_id: str, changes: dict) -> dict:
+        return self._write("reminder-update", {"id": reminder_id, "changes": changes})
+
+    def delete_reminder(self, reminder_id: str) -> dict:
+        return self._write("reminder-delete", {"id": reminder_id})
 
     def free_slots(
         self, day: date, start_hour: int = 8, end_hour: int = 20, min_minutes: int = 30
