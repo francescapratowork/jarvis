@@ -85,7 +85,7 @@ cd ~/jarvis
 Every time Jarvis starts, its first lines show which version is running and from which folder, e.g.:
 
 ```
-Jarvis version 2026-10-06.11 (full-screen interface, 7 s lead-in, no auto-opened apps) — running /Users/you/jarvis/jarvis.py
+Jarvis version 2026-10-06.12 (interface ready handshake before Spotify, focus guard) — running /Users/you/jarvis/jarvis.py
 Settings file: /Users/you/jarvis/.env (found)
 ```
 
@@ -103,6 +103,9 @@ Stay quiet for the first two seconds while Jarvis measures the room noise. When 
 ```
 DOUBLE CLAP DETECTED!
 Microphone closed — Jarvis is no longer listening. Running the welcome sequence...
+Jarvis interface: launching...
+Jarvis interface: fullscreen and ready (1.4s).
+Spotify: starting in background...
 Spotify: asking it to play spotify:track:… at 70% (your previous Spotify volume; Spotify volume was 70%)...
 Spotify: SUCCESS — playing "…" by … at 70%.
 Spotify: ducking 70% → 35% over 0.5s for the voice...
@@ -195,7 +198,7 @@ Advanced shape checks (`CLAP_RMS_RATIO`, `MIN_HF_RATIO`, `MAX_CLAP_LEN_S`, `QUIE
   - *music too loud/quiet under the voice*: change `JARVIS_SPOTIFY_DUCK_VOLUME` (e.g. `25` or `45`); after the voice, `JARVIS_SPOTIFY_NORMAL_VOLUME`.
   - Also check your Mac isn't muted. Jarvis warns if it is.
 - **The interface doesn't appear:** look for a `Jarvis interface:` line in Terminal. If it mentions `pywebview`, run `./start_jarvis.sh` again (it installs it). Try `./start_jarvis.sh --ui-demo` to test the interface on its own. Set `JARVIS_UI_ENABLED=false` to run without it.
-- **Spotify's window shows up:** Jarvis launches Spotify hidden and brings the interface back to the front; if Spotify was already open on another desktop, macOS may briefly switch to it. Quitting Spotify before clapping avoids this.
+- **Spotify's window shows up:** Jarvis only starts Spotify after the interface reports it is full screen and in front, launches it hidden, and while starting up immediately takes the front back from any app that grabs it (Terminal shows `… took focus — brought Jarvis back to the front`). If the interface reports `fullscreen=False` or `in front=False`, macOS refused it — send that line along when reporting the problem.
 - **No welcome speech:** Check `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in `.env`, and look for an `ElevenLabs TTS failed` line in Terminal. A `404 Not Found` whose address contains something other than your voice ID (e.g. `/v1/text-to-speech/open%20-e%20...`) means the `ELEVENLABS_VOICE_ID=` line holds the wrong text: put only the voice ID after the `=`.
 - **A fix doesn't seem to apply:** Check the `Jarvis version … running …` line at startup, then run `./update_jarvis.sh`.
 - **`zsh: permission denied: ./start_jarvis.sh`:** Run `chmod +x start_jarvis.sh` once.

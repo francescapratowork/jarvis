@@ -74,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.11 (full-screen interface, 7 s lead-in, no auto-opened apps)"
+JARVIS_VERSION = "2026-10-06.12 (interface ready handshake before Spotify, focus guard)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -444,14 +444,24 @@ def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
 class JarvisUI:
     """Client for the full-screen interface process (jarvis_ui.py).
 
-    Messages are JSON lines on the child's stdin. Every method is a safe no-op when the
-    interface is disabled, failed to start, or was closed by the user.
+    Messages go to the child as JSON lines on its stdin; the child answers with JSON event
+    lines on its stdout ("ready", "focused", "refocused"). Every method is a safe no-op
+    when the interface is disabled, failed to start, or was closed by the user.
     """
+
+    READY_TIMEOUT_S = 20.0
+    FOCUS_TIMEOUT_S = 4.0
 
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._reported_dead = False
+        self._ready = threading.Event()
+        self.ready_info: dict = {}
+        self._acks: dict[int, dict] = {}
+        self._ack_cond = threading.Condition()
+        self._next_ack = 0
+        self._t_launch = 0.0
 
     def start(self) -> bool:
         if not JARVIS_UI_ENABLED:
@@ -460,11 +470,13 @@ class JarvisUI:
         if not script.is_file():
             log.warning("Jarvis interface: %s is missing — skipping the interface.", script.name)
             return False
+        log.info("Jarvis interface: launching...")
+        self._t_launch = time.monotonic()
         try:
             self.proc = subprocess.Popen(
                 [sys.executable, str(script)],
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 text=True,
                 bufsize=1,
             )
@@ -472,8 +484,61 @@ class JarvisUI:
             log.warning("Jarvis interface: could not start (%s).", e)
             self.proc = None
             return False
-        log.info("Jarvis interface: opening full screen...")
+        threading.Thread(target=self._read_events, daemon=True).start()
         threading.Thread(target=self._telemetry, daemon=True).start()
+        return True
+
+    def _read_events(self) -> None:
+        proc = self.proc
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind = ev.get("event") if isinstance(ev, dict) else None
+            if kind == "ready":
+                self.ready_info = ev
+                self._ready.set()
+            elif kind == "focused":
+                with self._ack_cond:
+                    self._acks[ev.get("ack")] = ev
+                    self._ack_cond.notify_all()
+            elif kind == "refocused":
+                log.info(
+                    "Jarvis interface: %s took focus — brought Jarvis back to the front.",
+                    ev.get("from") or "another app",
+                )
+        # Child exited: wake anyone still waiting for it.
+        self._ready.set()
+        with self._ack_cond:
+            self._ack_cond.notify_all()
+
+    def wait_ready(self, timeout: float | None = None) -> bool:
+        """Block until the interface reports it is loaded, full screen and in front."""
+        if self.proc is None:
+            return False
+        timeout = self.READY_TIMEOUT_S if timeout is None else timeout
+        if not self._ready.wait(timeout):
+            log.warning(
+                "Jarvis interface: not ready after %.0fs — continuing without waiting.", timeout
+            )
+            return False
+        info = self.ready_info
+        if not info:  # the child exited before becoming ready
+            self.alive()
+            return False
+        took = time.monotonic() - self._t_launch
+        if info.get("fullscreen") and info.get("active"):
+            log.info("Jarvis interface: fullscreen and ready (%.1fs).", took)
+        else:
+            log.warning(
+                "Jarvis interface: ready after %.1fs but fullscreen=%s, in front=%s "
+                "(frontmost app: %s).",
+                took,
+                info.get("fullscreen"),
+                info.get("active"),
+                info.get("frontmost") or "?",
+            )
         return True
 
     def alive(self) -> bool:
@@ -500,9 +565,40 @@ class JarvisUI:
         except (BrokenPipeError, OSError, ValueError):
             pass
 
+    def guard(self, on: bool) -> None:
+        """While on, the interface takes focus back from any app that grabs it."""
+        self.send(guard=bool(on))
+
+    def ensure_focus(self, reason: str = "") -> bool:
+        """Bring the interface to the front and wait until it confirms it is the active app."""
+        if not self.alive():
+            return False
+        with self._ack_cond:
+            self._next_ack += 1
+            ack = self._next_ack
+        self.send(focus=True, ack=ack)
+        deadline = time.monotonic() + self.FOCUS_TIMEOUT_S
+        with self._ack_cond:
+            while ack not in self._acks and self.alive():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._ack_cond.wait(left)
+            ev = self._acks.pop(ack, None)
+        if ev is None:
+            log.warning("Jarvis interface: no focus confirmation (%s).", reason or "focus")
+            return False
+        if not ev.get("active"):
+            log.warning(
+                "Jarvis interface: could not take the front (%s; frontmost app: %s).",
+                reason or "focus",
+                ev.get("frontmost") or "?",
+            )
+            return False
+        return True
+
     def focus(self) -> None:
-        """Bring the interface back to the front (e.g. after Spotify was launched)."""
-        self.send(focus=True)
+        self.ensure_focus()
 
     def wait_closed(self) -> None:
         if self.proc is not None:
@@ -1003,7 +1099,7 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
     """Launch Spotify if needed and play `uri` at full volume, logging a clear result.
     Returns a SpotifyPlayback to duck/restore the music, or None on failure."""
     if not _spotify_running():
-        log.info("Spotify: starting the app in the background (hidden)...")
+        log.info("Spotify: starting in background...")
         # -g: don't bring it to the front; -j: launch it hidden. Jarvis keeps the screen.
         subprocess.run(["open", "-g", "-j", "-a", "Spotify"], check=False)
         deadline = time.monotonic() + 20
@@ -1012,8 +1108,11 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
         if not _spotify_running():
             log.error("Spotify: ERROR — the app did not start within 20 seconds.")
             return None
-        UI.focus()
+        UI.ensure_focus("after Spotify launched")
         time.sleep(3)  # let it log in and load the player
+        UI.ensure_focus("Spotify finished launching")
+    else:
+        log.info("Spotify: already running — controlling it in the background...")
     previous = _spotify_get_volume()
     playback = SpotifyPlayback(previous)
     start_volume = playback.full_volume
@@ -1030,7 +1129,7 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
         # Fallback: open the track via its spotify: link, then press play.
         log.info("Spotify: not playing yet (state: %s); retrying via the track link...", fields[0])
         subprocess.run(["open", "-g", uri], check=False)
-        UI.focus()
+        UI.ensure_focus("after opening the track link")
         time.sleep(1.5)
         status, fields = _spotify_try_play("play", 6, start_volume)
 
@@ -1039,7 +1138,7 @@ def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
         log.info(
             "Spotify: SUCCESS — playing \"%s\" by %s at %d%%.", name, artist, start_volume
         )
-        UI.focus()
+        UI.ensure_focus("Spotify playing")  # confirmed in front before the lead-in starts
         UI.send(
             music={"track": name, "artist": artist, "volume": start_volume},
             log=f"Audio link: {name} — {artist}",
@@ -1266,10 +1365,8 @@ def run_double_clap_actions() -> None:
     """
     UI.start()
     UI.send(state="STARTING", mic="closed", log="Double clap confirmed", highlight=True)
-    if IS_MAC:
-        _check_mac_output_volume()
 
-    # Fetch/load the voice in the background while Spotify starts, so it can speak right away.
+    # Fetch/load the voice in the background meanwhile, so it can speak right away later.
     prepared: dict = {}
     prep: threading.Thread | None = None
     if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
@@ -1281,6 +1378,13 @@ def run_double_clap_actions() -> None:
 
         prep = threading.Thread(target=_prepare, daemon=True)
         prep.start()
+
+    # Nothing else happens until the interface is loaded, full screen and in front.
+    if UI.alive():
+        UI.wait_ready()
+        UI.guard(True)  # from now on, any app that grabs focus is pushed back
+    if IS_MAC:
+        _check_mac_output_volume()
 
     music: SpotifyPlayback | None = None
     try:
@@ -1314,6 +1418,7 @@ def run_double_clap_actions() -> None:
             music.restore(fade=False)
 
     UI.send(state="ONLINE", prompt="AWAITING COMMAND", log="Awaiting command")
+    UI.guard(False)  # startup done: switching apps is up to the user again
     if UI.alive():
         log.info(
             "Jarvis interface is open and awaiting commands. Close it with Esc twice, the "
@@ -1332,6 +1437,7 @@ def run_ui_demo() -> int:
     if not UI.start():
         log.error("Jarvis interface could not start (JARVIS_UI_ENABLED=false?).")
         return 1
+    UI.wait_ready()
     script = [
         (0.5, dict(state="STARTING", log="UI demo — no audio", highlight=True)),
         (0.5, dict(music={"track": "Demo Track", "artist": "Jarvis", "volume": 65}, log="Audio link: demo")),
