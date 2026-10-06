@@ -46,8 +46,10 @@ Actions (macOS):
     With JARVIS_WELCOME_CACHE_ENABLED, audio is saved under `.cache/jarvis_welcome/` (WAV) and
     replayed when phrase + voice + model + format match—no repeat API call. Delete that folder
     or set JARVIS_WELCOME_CACHE_ENABLED=false to force a fresh fetch.
-  The welcome sequence runs only once per process; Spotify is started (and confirmed playing)
-    first, then Chrome and Cursor open while the welcome is spoken.
+  The welcome sequence runs only once per process: Spotify starts quietly (ducked, its own
+    volume only), the voice speaks over it, then the music fades up while Chrome and Cursor open.
+  JARVIS_SPOTIFY_DUCK_VOLUME / _NORMAL_VOLUME / _RESTORE_PREVIOUS / _FADE_SECONDS /
+    _FADE_IN_SECONDS — audio ducking (see .env.example).
 """
 
 from __future__ import annotations
@@ -74,7 +76,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-05.6 (Spotify AppleScript fix, updater)"
+JARVIS_VERSION = "2026-10-06.7 (audio ducking: music under the voice, smooth fade-up)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -152,8 +154,27 @@ SONG_URI = _env_str(
     "JARVIS_SONG_URI",
     "https://open.spotify.com/track/39shmbIHICJ2Wxnk1fPSdz?si=2900c75c2e2d4b82",
 )
-# Optional Spotify volume (0–100) set before playing; empty = leave unchanged.
+# Legacy setting (0–100); now only used as the default for JARVIS_SPOTIFY_NORMAL_VOLUME.
 SPOTIFY_VOLUME = _env_str("SPOTIFY_VOLUME")
+
+
+def _volume(v: int) -> int:
+    return max(0, min(100, v))
+
+
+# Audio ducking (Spotify's own volume, not the Mac's): the music starts quietly under the
+# spoken welcome, then fades up once the voice has finished.
+SPOTIFY_DUCK_VOLUME = _volume(_env_int("JARVIS_SPOTIFY_DUCK_VOLUME", 18))
+SPOTIFY_NORMAL_VOLUME = _volume(
+    _env_int(
+        "JARVIS_SPOTIFY_NORMAL_VOLUME", int(SPOTIFY_VOLUME) if SPOTIFY_VOLUME.isdigit() else 65
+    )
+)
+SPOTIFY_FADE_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_FADE_SECONDS", 2.5))
+SPOTIFY_FADE_IN_SECONDS = max(0.0, _env_float("JARVIS_SPOTIFY_FADE_IN_SECONDS", 1.0))
+# True = fade back up to the volume Spotify had before Jarvis started (if it was louder than
+# the duck level); False = always fade up to JARVIS_SPOTIFY_NORMAL_VOLUME.
+SPOTIFY_RESTORE_PREVIOUS = _env_bool("JARVIS_SPOTIFY_RESTORE_PREVIOUS", True)
 
 # Cursor: bring existing instance to the front. Set OPEN_NEW_CURSOR_ON_DOUBLE_CLAP for a new window as well.
 FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP = _env_bool("FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP", True)
@@ -181,8 +202,8 @@ JARVIS_WELCOME_ENABLED = _env_bool("JARVIS_WELCOME_ENABLED", True)
 JARVIS_WELCOME_PHRASE = _env_str(
     "JARVIS_WELCOME_PHRASE", "Welcome home, sir. All systems are online."
 )
-# Seconds after launching SONG_URI before speaking (gives Spotify/browser time to start).
-JARVIS_AFTER_SONG_DELAY_S = _env_float("JARVIS_AFTER_SONG_DELAY_S", 1.0)
+# Seconds between the music starting and the voice starting.
+JARVIS_AFTER_SONG_DELAY_S = _env_float("JARVIS_AFTER_SONG_DELAY_S", 0.5)
 # Save ElevenLabs PCM as WAV under .cache/jarvis_welcome/; replay skips the API when the key matches.
 JARVIS_WELCOME_CACHE_ENABLED = _env_bool("JARVIS_WELCOME_CACHE_ENABLED", True)
 
@@ -379,7 +400,7 @@ def _jarvis_welcome_cache_path(
     return _jarvis_welcome_cache_dir() / f"{digest}.wav"
 
 
-def _play_pcm_wav_file(path: Path) -> bool:
+def _read_pcm_wav_file(path: Path) -> tuple[np.ndarray, int] | None:
     try:
         with wave.open(str(path), "rb") as wf:
             ch = wf.getnchannels()
@@ -387,22 +408,14 @@ def _play_pcm_wav_file(path: Path) -> bool:
             rate = wf.getframerate()
             if ch != 1 or sw != 2:
                 log.warning("Unsupported cached WAV (channels=%s, width=%s).", ch, sw)
-                return False
+                return None
             raw = wf.readframes(wf.getnframes())
     except (OSError, wave.Error) as e:
         log.warning("Could not read cached welcome audio: %s", e)
-        return False
+        return None
     if not raw:
-        return False
-    pcm_i16 = np.frombuffer(raw, dtype=np.int16)
-    pcm_f = pcm_i16.astype(np.float32) / 32768.0
-    try:
-        sd.play(pcm_f, rate)
-        sd.wait()
-    except Exception as e:
-        log.warning("Could not play cached welcome audio: %s", e)
-        return False
-    return True
+        return None
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0, rate
 
 
 def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
@@ -421,32 +434,36 @@ def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
         raise
 
 
-def say_jarvis_welcome() -> None:
+def prepare_welcome_audio() -> tuple[np.ndarray, int] | None:
+    """Load the spoken welcome (from cache, or from ElevenLabs) without playing it, so it can
+    be fetched while Spotify is starting. Returns (samples, sample_rate) or None."""
     if not JARVIS_WELCOME_ENABLED or not JARVIS_WELCOME_PHRASE.strip():
-        return
+        return None
     text = JARVIS_WELCOME_PHRASE.strip()
     vid, model_id, output_format, pcm_rate = elevenlabs_env_config()
     if not vid:
         log.warning("Set ELEVENLABS_VOICE_ID in the environment for ElevenLabs TTS.")
-        return
+        return None
 
     cache_path = _jarvis_welcome_cache_path(text, vid, model_id, output_format)
     if JARVIS_WELCOME_CACHE_ENABLED and cache_path.is_file():
-        log.info("Playing welcome from cache: %s", cache_path)
-        if _play_pcm_wav_file(cache_path):
-            return
+        audio = _read_pcm_wav_file(cache_path)
+        if audio is not None:
+            log.info("Welcome voice: loaded from cache (%s).", cache_path.name)
+            return audio
         log.warning("Cache miss after read failure; fetching from ElevenLabs.")
 
     api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     if not api_key:
         log.warning("Set ELEVENLABS_API_KEY in the environment for ElevenLabs TTS.")
-        return
+        return None
     try:
         from elevenlabs.client import ElevenLabs
     except ImportError:
         log.warning("Install dependencies: pip install -r requirements.txt")
-        return
+        return None
     try:
+        log.info("Welcome voice: fetching from ElevenLabs...")
         client = ElevenLabs(api_key=api_key)
         chunks = client.text_to_speech.convert(
             voice_id=vid,
@@ -457,23 +474,36 @@ def say_jarvis_welcome() -> None:
         raw = b"".join(chunks)
     except Exception as e:
         log.warning("ElevenLabs TTS failed: %s", e)
-        return
+        return None
     if not raw:
         log.warning("ElevenLabs returned empty audio.")
-        return
+        return None
     if JARVIS_WELCOME_CACHE_ENABLED:
         try:
             _save_pcm_wav_file(cache_path, raw, pcm_rate)
             log.info("Saved welcome audio to cache: %s", cache_path)
         except OSError as e:
             log.warning("Could not save welcome cache: %s", e)
-    pcm_i16 = np.frombuffer(raw, dtype=np.int16)
-    pcm_f = pcm_i16.astype(np.float32) / 32768.0
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0, pcm_rate
+
+
+def play_welcome_audio(pcm: np.ndarray, rate: int) -> bool:
+    """Play the spoken welcome through the default output and wait until it has finished."""
+    log.info("Welcome voice: speaking (%.1fs)...", len(pcm) / max(1, rate))
     try:
-        sd.play(pcm_f, pcm_rate)
+        sd.play(pcm, rate)
         sd.wait()
     except Exception as e:
         log.warning("Could not play ElevenLabs audio: %s", e)
+        return False
+    log.info("Welcome voice: finished.")
+    return True
+
+
+def say_jarvis_welcome() -> None:
+    audio = prepare_welcome_audio()
+    if audio is not None:
+        play_welcome_audio(*audio)
 
 
 # --- macOS helpers ------------------------------------------------------------
@@ -669,15 +699,17 @@ def _spotify_running() -> bool:
         return False
 
 
-def _spotify_try_play(command: str, attempts: int) -> tuple[str, list[str]]:
+def _spotify_try_play(
+    command: str, attempts: int, start_volume: int | None = None
+) -> tuple[str, list[str]]:
     """Run a Spotify play command until the player reports "playing".
 
-    Returns (status, fields): status is "ok" (fields: name, artist, volume),
-    "error" (fields: error number, message) or "notplaying" (fields: state, last error).
+    `start_volume` (0–100) is applied to Spotify's own volume right before playing, so the
+    music never starts loud. Returns (status, fields): status is "ok" (fields: name,
+    artist, volume), "error" (fields: error number, message) or "notplaying" (fields:
+    state, last error).
     """
-    volume = ""
-    if SPOTIFY_VOLUME.isdigit():
-        volume = f"set sound volume to {max(0, min(100, int(SPOTIFY_VOLUME)))}"
+    volume = "" if start_volume is None else f"set sound volume to {_volume(start_volume)}"
     # Note: AppleScript reserves short words such as st/nd/rd/th (ordinal suffixes, "1st"),
     # so variables here use long descriptive names.
     script = f"""
@@ -688,13 +720,15 @@ repeat {attempts} times
       {volume}
       {command}
     end tell
-    delay 1
-    tell application "Spotify"
-      if player state is playing then
-        set nowPlaying to current track
-        return "ok|" & (name of nowPlaying) & "|" & (artist of nowPlaying) & "|" & (sound volume as text)
-      end if
-    end tell
+    repeat 8 times
+      delay 0.25
+      tell application "Spotify"
+        if player state is playing then
+          set nowPlaying to current track
+          return "ok|" & (name of nowPlaying) & "|" & (artist of nowPlaying) & "|" & (sound volume as text)
+        end if
+      end tell
+    end repeat
   on error errMsg number errNum
     set lastErr to (errNum as text) & "|" & errMsg
     if errNum is -1743 then return "error|" & lastErr
@@ -707,15 +741,108 @@ try
 end try
 return "notplaying|" & playerStateText & "|" & lastErr
 """
-    ok, out, err = _osascript(script, timeout=attempts * 2.0 + 30)
+    ok, out, err = _osascript(script, timeout=attempts * 3.0 + 30)
     if not ok:
         return "error", ["", err]
     status, _, rest = out.partition("|")
     return status, rest.split("|")
 
 
-def _play_in_spotify_app(uri: str) -> bool:
-    """Launch Spotify if needed, play `uri`, and log a clear result."""
+def _spotify_get_volume() -> int | None:
+    ok, out, _ = _osascript('tell application "Spotify" to return (sound volume as text)', timeout=10)
+    return int(out) if ok and out.strip().isdigit() else None
+
+
+def _spotify_set_volume(volume: int) -> bool:
+    ok, _, err = _osascript(
+        f'tell application "Spotify" to set sound volume to {_volume(volume)}', timeout=10
+    )
+    if not ok:
+        log.warning("Spotify: could not set its volume: %s", err)
+    return ok
+
+
+def _fade_steps(start: int, end: int, seconds: float, step_s: float = 0.1) -> list[int]:
+    """Volume values for a smooth (ease-in-out) fade, one every `step_s` seconds."""
+    n = max(1, int(round(seconds / step_s)))
+    values = []
+    for i in range(1, n + 1):
+        x = i / n
+        eased = x * x * (3 - 2 * x)  # smoothstep: gentle start and finish
+        values.append(int(round(start + (end - start) * eased)))
+    return values
+
+
+def _spotify_fade(start: int, end: int, seconds: float) -> bool:
+    """Fade Spotify's own volume from `start` to `end` in one AppleScript (no stutter
+    between steps). Only Spotify's volume changes; the Mac's system volume is untouched."""
+    start, end = _volume(start), _volume(end)
+    if seconds <= 0 or start == end:
+        return _spotify_set_volume(end)
+    steps = ", ".join(str(v) for v in _fade_steps(start, end, seconds))
+    script = f"""
+tell application "Spotify"
+  repeat with stepVolume in {{{steps}}}
+    set sound volume to (contents of stepVolume)
+    delay 0.1
+  end repeat
+  return (sound volume as text)
+end tell
+"""
+    ok, _, err = _osascript(script, timeout=seconds + 15)
+    if not ok:
+        log.warning("Spotify: fade failed (%s); setting the volume directly.", err)
+        return _spotify_set_volume(end)
+    return True
+
+
+class SpotifyPlayback:
+    """Spotify is playing, ducked under the voice. restore() fades it back up."""
+
+    def __init__(self, previous_volume: int | None) -> None:
+        self.previous_volume = previous_volume
+        self.fade_in: threading.Thread | None = None
+        self.restored = False
+
+    def target_volume(self) -> tuple[int, str]:
+        prev = self.previous_volume
+        if SPOTIFY_RESTORE_PREVIOUS and prev is not None and prev > SPOTIFY_DUCK_VOLUME:
+            return prev, "your previous Spotify volume"
+        return SPOTIFY_NORMAL_VOLUME, "JARVIS_SPOTIFY_NORMAL_VOLUME"
+
+    def start_fade_in(self) -> None:
+        """Bring the music in from silence to the duck level, in the background."""
+        if SPOTIFY_FADE_IN_SECONDS <= 0:
+            return
+        self.fade_in = threading.Thread(
+            target=_spotify_fade,
+            args=(0, SPOTIFY_DUCK_VOLUME, SPOTIFY_FADE_IN_SECONDS),
+            daemon=True,
+        )
+        self.fade_in.start()
+
+    def restore(self, *, fade: bool = True) -> None:
+        if self.restored:
+            return
+        self.restored = True
+        if self.fade_in is not None:
+            self.fade_in.join(timeout=SPOTIFY_FADE_IN_SECONDS + 15)
+        target, why = self.target_volume()
+        seconds = SPOTIFY_FADE_SECONDS if fade else 0.0
+        log.info(
+            "Spotify: fading music up %d%% → %d%% over %.1fs (%s)...",
+            SPOTIFY_DUCK_VOLUME,
+            target,
+            seconds,
+            why,
+        )
+        if _spotify_fade(SPOTIFY_DUCK_VOLUME, target, seconds):
+            log.info("Spotify: restored to %d%%.", target)
+
+
+def _play_in_spotify_app(uri: str) -> SpotifyPlayback | None:
+    """Launch Spotify if needed and play `uri` ducked (quiet), logging a clear result.
+    Returns a SpotifyPlayback to fade the music back up later, or None on failure."""
     if not _spotify_running():
         log.info("Spotify: starting the app...")
         subprocess.run(["open", "-g", "-a", "Spotify"], check=False)
@@ -724,24 +851,38 @@ def _play_in_spotify_app(uri: str) -> bool:
             time.sleep(0.5)
         if not _spotify_running():
             log.error("Spotify: ERROR — the app did not start within 20 seconds.")
-            return False
+            return None
         time.sleep(3)  # let it log in and load the player
-    log.info("Spotify: asking it to play %s ...", uri)
+    previous = _spotify_get_volume()
+    start_volume = 0 if SPOTIFY_FADE_IN_SECONDS > 0 else SPOTIFY_DUCK_VOLUME
+    log.info(
+        "Spotify: asking it to play %s, starting quietly (Spotify volume was %s)...",
+        uri,
+        f"{previous}%" if previous is not None else "unknown",
+    )
 
-    status, fields = _spotify_try_play(f"play track {_as_str(uri)}", attempts=10)
+    status, fields = _spotify_try_play(f"play track {_as_str(uri)}", 10, start_volume)
     if status == "notplaying":
         # Fallback: open the track via its spotify: link, then press play.
         log.info("Spotify: not playing yet (state: %s); retrying via the track link...", fields[0])
         subprocess.run(["open", "-g", uri], check=False)
         time.sleep(1.5)
-        status, fields = _spotify_try_play("play", attempts=6)
+        status, fields = _spotify_try_play("play", 6, start_volume)
 
     if status == "ok":
-        name, artist, volume = (fields + ["", "", ""])[:3]
-        log.info("Spotify: SUCCESS — playing \"%s\" by %s (Spotify volume %s%%).", name, artist, volume)
-        if volume.isdigit() and int(volume) < 10:
-            log.warning("Spotify: its volume is almost 0 — set SPOTIFY_VOLUME=60 in .env.")
-        return True
+        name, artist = (fields + ["", ""])[:2]
+        log.info("Spotify: SUCCESS — playing \"%s\" by %s.", name, artist)
+        playback = SpotifyPlayback(previous)
+        if SPOTIFY_FADE_IN_SECONDS > 0:
+            log.info(
+                "Spotify: ducked — fading in to %d%% over %.1fs, under the voice.",
+                SPOTIFY_DUCK_VOLUME,
+                SPOTIFY_FADE_IN_SECONDS,
+            )
+            playback.start_fade_in()
+        else:
+            log.info("Spotify: ducked to %d%% under the voice.", SPOTIFY_DUCK_VOLUME)
+        return playback
     if status == "error":
         num, msg = (fields + ["", ""])[:2]
         if num == "-1743" or "-1743" in msg or "not authorized" in msg.lower():
@@ -752,25 +893,30 @@ def _play_in_spotify_app(uri: str) -> bool:
             )
         else:
             log.error("Spotify: ERROR — %s %s", num, msg)
-        return False
-    state, last = fields[0] if fields else "unknown", "|".join(fields[1:])
-    log.error(
-        "Spotify: ERROR — the app did not start playing (state: %s%s). Check that you are "
-        "logged in, that the track plays when you click it in Spotify, and that no other "
-        "device is controlling playback (Spotify Connect).",
-        state,
-        f"; last error: {last}" if last else "",
-    )
-    return False
+    else:
+        state, last = fields[0] if fields else "unknown", "|".join(fields[1:])
+        log.error(
+            "Spotify: ERROR — the app did not start playing (state: %s%s). Check that you are "
+            "logged in, that the track plays when you click it in Spotify, and that no other "
+            "device is controlling playback (Spotify Connect).",
+            state,
+            f"; last error: {last}" if last else "",
+        )
+    # Don't leave Spotify silent/ducked if it failed after we lowered its volume.
+    if previous is not None:
+        _spotify_set_volume(previous)
+    return None
 
 
-def play_song(uri: str) -> bool:
+def play_song(uri: str) -> SpotifyPlayback | None:
     """Start the configured song. On macOS with the Spotify app this waits until Spotify
-    reports it is playing (or fails), so any permission prompt shows before Chrome opens."""
+    reports it is playing (or fails), so any permission prompt shows before Chrome opens,
+    and returns a SpotifyPlayback (music ducked) to fade up later. Other links (YouTube,
+    web player) just open and return None (no ducking possible)."""
     u = uri.strip()
     if not u:
         log.info("No song configured (JARVIS_SONG_URI is empty).")
-        return False
+        return None
     spotify = _spotify_uri(u)
     if IS_MAC and spotify:
         if _mac_app_path("Spotify"):
@@ -782,11 +928,10 @@ def play_song(uri: str) -> bool:
             subprocess.run(["open", u], check=False)
         else:
             webbrowser.open(u)
-        log.info("Opened song link: %s", u)
-        return True
+        log.info("Opened song link: %s (volume ducking only works with the Spotify app)", u)
     except OSError as e:
         log.warning("Could not open JARVIS_SONG_URI: %s", e)
-        return False
+    return None
 
 
 def _check_mac_output_volume() -> None:
@@ -946,24 +1091,57 @@ def open_cursor_window() -> None:
         _mac_set_fullscreen("Cursor", wait_s=15.0)
 
 
-def run_double_clap_actions() -> None:
-    """The welcome sequence. Runs once, after the microphone is closed, and returns only
-    when everything (including the spoken welcome) has finished."""
-    if IS_MAC:
-        _check_mac_output_volume()
-    play_song(SONG_URI)
+def open_workspace() -> None:
     open_claude_in_chrome()
     open_tasaradar_in_chrome()
-    voice: threading.Thread | None = None
-    if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
-        delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
-        if delay:
-            time.sleep(delay)
-        voice = threading.Thread(target=say_jarvis_welcome, daemon=True)
-        voice.start()
     open_cursor_window()
-    if voice is not None:
-        voice.join(timeout=120)
+
+
+def run_double_clap_actions() -> None:
+    """The welcome sequence. Runs once, after the microphone is closed, and returns only
+    when everything has finished:
+
+      music starts quietly (ducked) → the voice speaks over it → the voice finishes →
+      the music fades up smoothly while the workspace (Chrome, Cursor) opens.
+    """
+    if IS_MAC:
+        _check_mac_output_volume()
+
+    # Fetch/load the voice in the background while Spotify starts, so it can speak right away.
+    prepared: dict = {}
+    prep: threading.Thread | None = None
+    if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
+        prep = threading.Thread(
+            target=lambda: prepared.update(audio=prepare_welcome_audio()), daemon=True
+        )
+        prep.start()
+
+    music: SpotifyPlayback | None = None
+    try:
+        music = play_song(SONG_URI)
+
+        if prep is not None:
+            delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
+            if delay:
+                time.sleep(delay)
+            prep.join(timeout=30)
+            audio = prepared.get("audio")
+            if audio is not None:
+                play_welcome_audio(*audio)
+            else:
+                log.warning("Welcome voice: not available — continuing without it.")
+
+        fade_up: threading.Thread | None = None
+        if music is not None:
+            fade_up = threading.Thread(target=music.restore, daemon=True)
+            fade_up.start()
+        open_workspace()
+        if fade_up is not None:
+            fade_up.join(timeout=SPOTIFY_FADE_SECONDS + SPOTIFY_FADE_IN_SECONDS + 30)
+    finally:
+        # Interrupted (Ctrl+C) or failed midway: never leave the music ducked.
+        if music is not None and not music.restored:
+            music.restore(fade=False)
 
 
 def _hf_ratio(seg: np.ndarray) -> float:
