@@ -10,4 +10,6 @@ anthropic>=1.11,<2; python_version >= "3.10"
 # Trusted root certificates for secure connections (macOS trust store, Mozilla bundle)
 truststore>=0.10; python_version >= "3.10"
 certifi>=2024.2.2
+# Phase 2B M3: HTTPS client for live research (Perplexity)
+httpx>=0.27,<1
 pyobjc-framework-EventKit>=10; sys_platform == "darwin"

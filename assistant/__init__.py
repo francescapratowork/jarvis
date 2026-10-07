@@ -14,6 +14,9 @@ Modules:
   onboarding    one-time, repeatable profile import (dry run → --apply)
   calendar      macOS Calendar/Reminders access (via calendar_helper subprocess)
   operations    confirmed calendar/reminder changes: routing, plans, action log, undo
+  research      live web research (Perplexity Agent API): validation, sources, cache, budget
+  business      local pipeline (companies, contacts, activities), KPIs, execution context
+  business_tools  the research and business tools Claude can use
   tools         tool registry: every capability is one tool, read or write
   brain         Claude conversation loop, confirmations, sentence streaming
   speech        microphone, realtime speech-to-text, streaming text-to-speech

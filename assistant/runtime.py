@@ -11,7 +11,9 @@ from .brain import Brain
 from .calendar import CalendarService, check_calendar_report
 from .config import AssistantConfig, load_config
 from .memory import MemoryStore
+from .business import BusinessStore
 from .operations import AREAS, OpsStore, resolve_calendar, resolve_reminder_list
+from .research import ResearchService
 from .tools import ToolContext, build_registry, open_mac_app
 
 log = logging.getLogger("jarvis.assistant")
@@ -26,6 +28,8 @@ def build_brain(cfg: AssistantConfig, on_log=lambda text: None, client=None) -> 
         log=on_log,
         actions=OpsStore(memory),
     )
+    ctx.business = BusinessStore(memory, settings=ctx.actions, min_sample=_kpi_min_sample())
+    ctx.research = ResearchService(memory)
     return Brain(cfg, memory, build_registry(), ctx, client=client)
 
 
@@ -145,6 +149,81 @@ def run_show_memory(args: list[str]) -> int:
                   + f"] {m['content']}")
         if not rows:
             print("- none")
+    return 0
+
+
+def _kpi_min_sample() -> int:
+    import os
+
+    try:
+        return max(1, int(os.environ.get("JARVIS_KPI_MIN_SAMPLE", "10")))
+    except ValueError:
+        return 10
+
+
+def run_research_check(args: list[str]) -> int:
+    """`./start_jarvis.sh --research-check`: is live research configured and reachable?
+    Uses the cheapest call (Search API, 1 result). The key itself is never shown."""
+    import os
+
+    from .research import PerplexityProvider, ResearchError, ResearchUnavailable
+
+    load_config()  # loads .env
+    provider = PerplexityProvider()
+    key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
+    if not key:
+        print("❌ PERPLEXITY_API_KEY is not set. Add it to the .env file in the jarvis folder (see README), then run this again.")
+        return 1
+    print(f"PERPLEXITY_API_KEY: set ({len(key)} characters — the key itself is never shown).")
+    print(f"Research preset: {provider.preset} (in-depth: {provider.deep_preset}) · endpoint: {provider.base_url}/v1/responses")
+    try:
+        results = provider.search_sources("Perplexity API status", max_results=1)
+        print(f"✅ Perplexity is reachable (test search returned {len(results)} result).")
+        return 0
+    except ResearchUnavailable as e:
+        print(f"❌ {e}")
+        return 1
+    except ResearchError as e:
+        if "HTTP 401" in str(e):
+            print(f"❌ Perplexity is not reachable: {e}")
+            return 1
+        print(f"Search API check did not work ({e}); trying the research endpoint once instead...")
+    try:
+        quick = PerplexityProvider(preset="fast-search")
+        res = quick.research("Reply with the single word OK.", "Answer briefly.", None)
+    except (ResearchUnavailable, ResearchError) as e:
+        print(f"❌ Perplexity research is not reachable: {e}")
+        return 1
+    print(f"✅ Perplexity research works (model {res.model or 'unknown'}).")
+    return 0
+
+
+def run_pipeline(args: list[str]) -> int:
+    """`./start_jarvis.sh --pipeline` and `--kpi`: the local business data, no API calls."""
+    cfg, store = _memory_store()
+    business = BusinessStore(store, settings=OpsStore(store), min_sample=_kpi_min_sample())
+    if "--kpi" in args:
+        for period in ("today", "this_week", "last_week"):
+            k = business.kpis(period)
+            print(f"{k['period']}: outreach {k['outreach']} · companies contacted {k['companies_contacted']} · replies "
+                  f"{k['replies']} (positive {k['positive_replies']}) · response rate {k['response_rate']} · discovery "
+                  f"booked {k['discovery_booked']}, done {k['discovery_completed']} · proposals {k['proposals_sent']} · "
+                  f"won {k['won']} (€{k['revenue_won_eur']:,.0f} known)")
+        return 0
+    pipe = business.pipeline()
+    print("Pipeline by stage: " + (", ".join(f"{k} {v}" for k, v in pipe["by_stage"].items()) or "empty"))
+    print(f"Known pipeline value: €{pipe['known_pipeline_value_eur']:,.0f} ({pipe['opportunities_with_known_value']} with a stated value)")
+    for c in business.list_companies(limit=50):
+        extra = []
+        if c.get("next_followup"):
+            extra.append(f"follow-up {c['next_followup']}")
+        if c.get("value_eur") not in (None, "UNKNOWN"):
+            extra.append(f"€{c['value_eur']:,.0f}")
+        print(f"  #{c['id']:<4} {c['stage']:<10} {c['name']}" + (f" — {c['website']}" if c.get("website") else "")
+              + (f"  ({', '.join(extra)})" if extra else "") + f"  [{c['evidence']}]")
+    overdue = business.overdue_followups()
+    if overdue:
+        print("Follow-ups due: " + "; ".join(f"{o['name']} ({o['next_followup']})" for o in overdue))
     return 0
 
 

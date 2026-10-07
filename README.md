@@ -221,6 +221,56 @@ For a day plan you approve all the blocks with one yes. "Annulla l'ultima cosa" 
 
 Writing needs the same **Full Access** to Calendars and Reminders that `./start_jarvis.sh --check-calendar` already set up. If that check shows "Direct access (EventKit): WORKING", nothing else is needed.
 
+### Business execution and market research (Phase 2B · M3)
+
+Jarvis keeps a small **business pipeline** on your Mac and can do **live market research** with Perplexity.
+
+**Talk to it naturally:**
+- Research:
+  - "Fammi una ricerca di mercato sulle automazioni AI per studi dentistici."
+  - "Confrontami dentisti, agenzie immobiliari e palestre come nicchia."
+- Prospects: "Trovami 10 aziende da intervistare in questa nicchia." They are saved in your pipeline.
+- Reporting what happened:
+  - "Ho scritto a XYZ su LinkedIn." · "XYZ mi ha risposto." · "Ho fatto la discovery con ABC."
+  - "Ho mandato una proposta da 3.000 euro." · "Questo lead non è interessato."
+- Numbers:
+  - "Quanti prospect ho contattato questa settimana?" · "Qual è il response rate?"
+  - "Quanto vale la pipeline conosciuta?" · "Confronta questa settimana con la precedente."
+- "Facciamo il check della giornata." Jarvis looks at what's already logged and asks only what's missing.
+
+**What Jarvis will and won't do:**
+- **Research results are labelled.** *FACT* means supported by a source; *INFERENCE*, *HYPOTHESIS* and *UNKNOWN* are kept separate. Sources are stored with each result.
+- **Company details are never invented.** Size, contacts and evidence of a problem are kept only when a source supports them; anything else stays *unknown*. Email addresses and phone numbers are never collected. Jarvis separates companies with public evidence of the problem from companies that only match the general profile.
+- **Numbers come only from what you report.** A proposal without an amount has an *unknown* value. With very few data points, Jarvis says the sample is too small (setting `JARVIS_KPI_MIN_SAMPLE`).
+- **Research never becomes a decision on its own.** Niche, ICP and offer stay hypotheses until you decide.
+- **Jarvis pushes towards action.** It suggests outreach instead of more research, surfaces due follow-ups, and proposes calendar blocks. Those blocks still need your yes, exactly as in M2.
+- **Logging what you report needs no confirmation.** Removing a logged item does need your yes.
+
+**Setting up research (one time):**
+1. Create an API key in your Perplexity account (API settings) and add credit there.
+2. Open the `.env` file in your jarvis folder (`open -e ~/jarvis/.env`) and add this line, with your key after the `=`:
+   ```
+   PERPLEXITY_API_KEY=your-key-here
+   ```
+   Save the file. Never paste the key anywhere else, including chats.
+3. Check it with `./start_jarvis.sh --research-check`. It makes one very small test search and never shows the key.
+
+Without the key everything else works; Jarvis just says that live research isn't available.
+
+**Cost control:**
+- Each research call is paid. Jarvis only researches when outside information is really needed, never for your own data, calendar or memory.
+- The same question asked again within `PERPLEXITY_CACHE_DAYS` (default 7) is answered from the stored result for free.
+- `PERPLEXITY_MAX_CALLS_PER_DAY` (default 25) caps paid calls per day.
+- In-depth research (`PERPLEXITY_DEEP_PRESET`) only runs when you ask for it.
+
+Jarvis uses Perplexity's Agent API (`/v1/responses`) with web search only.
+
+**See your data without talking:**
+- `./start_jarvis.sh --pipeline` shows companies by stage, follow-ups due and known value.
+- `./start_jarvis.sh --kpi` shows today, this week and last week.
+
+These use no paid API and work without voice credits, as does `./start_jarvis.sh --chat`.
+
 ### Jarvis's memory (Phase 2B · M1)
 
 Jarvis keeps a structured long-term memory on your Mac (`data/jarvis_memory.db`, never uploaded):
