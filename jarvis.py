@@ -74,7 +74,7 @@ import numpy as np
 import sounddevice as sd
 
 # Bump on every release so the startup log shows which code is actually running.
-JARVIS_VERSION = "2026-10-06.17 (Phase 2B M2: operational Calendar + Reminders)"
+JARVIS_VERSION = "2026-10-07.18 (Phase 2B M3: business execution + Perplexity research)"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
 
@@ -1787,6 +1787,14 @@ def main() -> int:
 
         args = sys.argv[sys.argv.index("--import-profile") + 1:]
         return run_import_profile(args)
+    if "--research-check" in sys.argv[1:]:
+        from assistant.runtime import run_research_check
+
+        return run_research_check(sys.argv[1:])
+    if "--pipeline" in sys.argv[1:] or "--kpi" in sys.argv[1:]:
+        from assistant.runtime import run_pipeline
+
+        return run_pipeline(sys.argv[1:])
     if any(f in sys.argv[1:] for f in ("--calendars", "--set-calendar", "--set-reminder-list")):
         from assistant.runtime import run_calendars
 

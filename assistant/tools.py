@@ -64,6 +64,8 @@ class ToolContext:
     open_app: Callable[[str], str]
     log: Callable[[str], None] = lambda text: None
     actions: Any = None  # operations.OpsStore: calendar routes + action log
+    business: Any = None  # business.BusinessStore: pipeline, activities, KPIs (M3)
+    research: Any = None  # research.ResearchService: live web research + history (M3)
     end_conversation: Callable[[], None] = lambda: None
     state: dict = field(default_factory=dict)
 
@@ -593,6 +595,9 @@ def build_registry() -> ToolRegistry:
         _obj({}),
         _end_conversation,
     ))
+    from .business_tools import register as register_business_tools
+
+    register_business_tools(reg, Tool)
     reg.register(Tool(
         "confirm_action",
         "Execute the pending action the user has just explicitly confirmed (yes / sì / confermo). "
